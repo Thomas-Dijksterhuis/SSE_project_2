@@ -39,9 +39,8 @@ volatile uint16_t writeIdx = 0;
 volatile uint16_t readIdx = 0;
 volatile uint16_t count = 0;
 
-struct AudioPacket {
+struct __attribute__((packed)) AudioPacket {
   char deviceId[16];
-  uint32_t timestamp;
   uint16_t length;
   int32_t samples[FRAME_SIZE];
 };
@@ -268,7 +267,6 @@ void sendTask(void *pv) {
         strncpy(payload.deviceId, deviceId, sizeof(payload.deviceId) - 1);
         payload.deviceId[15] = '\0';
         payload.length = FRAME_SIZE * sizeof(int32_t);
-        payload.timestamp = millis();
         memcpy(payload.samples, frame, sizeof(payload.samples));
 
         bool code = client.publish(
