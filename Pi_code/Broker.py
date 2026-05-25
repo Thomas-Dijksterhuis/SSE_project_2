@@ -9,12 +9,12 @@ import psycopg2
 import datetime
 import json
 
-credentials = json.load(open('credentials.json'))
-Port = credentials["Port"]
-db_name = credentials["db_name"]
-user = credentials["user"]
-password = credentials["password"]
-host = credentials["host"]
+credentials = json.load(open('PI_code/credentials.json'))
+Port = credentials["database"]["Port"]
+db_name = credentials["database"]["db_name"]
+user = credentials["database"]["user"]
+password = credentials["database"]["password"]
+host = credentials["database"]["host"]
 
 conn = psycopg2.connect(
     dbname=db_name,
@@ -28,13 +28,8 @@ conn = psycopg2.connect(
 cur = conn.cursor()
 
 
-BROKER_ADDRESS = "192.168.1.226"
-TOPIC = "Readings"
-SAMPLE_RATE = 10000
-CHANNELS = 1
-SAMPLE_WIDTH_BYTES = 2
-SAVE_SECONDS = 20
-SAMPLES_PER_FILE = SAMPLE_RATE * SAVE_SECONDS
+SAMPLES_PER_FILE = credentials["recording"]["sample_rate"] * credentials["recording"]["save_seconds"]
+FILE_DURATION = datetime.timedelta(seconds=credentials["recording"]["save_seconds"])
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -91,9 +86,9 @@ def save_wav(device_id, samples, start_timestamp, stop_timestamp):
     out_path = RECORDINGS_DIR / f"{device_id}/{date_dir}/{start_label}_{stop_label}.wav"
 
     with wave.open(str(out_path), "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(SAMPLE_WIDTH_BYTES)
-        wf.setframerate(SAMPLE_RATE)
+        wf.setnchannels(credentials["recording"]["channels"])
+        wf.setsampwidth(credentials["recording"]["sample_width_bytes"])
+        wf.setframerate(credentials["recording"]["sample_rate"])
         wf.writeframes(pcm.tobytes())
 
     print(f"Saved NLMS error signal with {len(pcm)} samples to {out_path}")
@@ -104,6 +99,7 @@ def on_message(client, userdata, message):
     global recorded_samples, file_start_timestamp
 
     payload = message.payload
+    message_received_at = datetime.datetime.now()
 
     header_size = 22
     if len(payload) < header_size:
@@ -126,16 +122,16 @@ def on_message(client, userdata, message):
         recorded_samples.append(cleaned)
 
     if file_start_timestamp is None:
-        file_start_timestamp = datetime.datetime.now()
+        file_start_timestamp = message_received_at
 
     while len(recorded_samples) >= SAMPLES_PER_FILE:
         chunk = recorded_samples[:SAMPLES_PER_FILE]
-        file_stop_timestamp = file_start_timestamp + datetime.timedelta(seconds=SAVE_SECONDS)
+        file_stop_timestamp = file_start_timestamp + FILE_DURATION
         save_wav(device_id, chunk, file_start_timestamp, file_stop_timestamp)
         recorded_samples = recorded_samples[SAMPLES_PER_FILE:]
 
         if recorded_samples:
-            file_start_timestamp += datetime.timedelta(seconds=SAVE_SECONDS)
+            file_start_timestamp = message_received_at
         else:
             file_start_timestamp = None
 
@@ -146,9 +142,8 @@ callback_api_version=mqtt.CallbackAPIVersion.VERSION2
 )
 
 client.on_message = on_message
-client.connect(BROKER_ADDRESS)
-client.subscribe(TOPIC)
-
+client.connect(credentials["MQTT"]["broker_address"])
+client.subscribe(credentials["MQTT"]["topic"])
 
 try:
     client.loop_forever()
