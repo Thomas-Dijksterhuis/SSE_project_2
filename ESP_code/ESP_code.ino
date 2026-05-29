@@ -1,24 +1,29 @@
 #include "driver/i2s.h"
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <SD.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
+#include <WiFiUdp.h>
 
 //SD card parameters
 int32_t fileIdx = 0;
 volatile bool sdReady = false;
-unsigned long sdLastCheck = 0;
+uint32_t sdLastCheck = 0;
+const char* idxFileName = "/missed_transmissions/file_index";
+uint32_t sleepMs = 0;
+uint32_t cycleStart = 0;
+bool cycleStarted = false;
+bool soundFileOpen = false;
 
-#define SD_FRAMES_PER_FILE 10000
-#define TARGET_PORT 50000
+#define PORT 50000
+
+QueueHandle_t udpQueue;
+SemaphoreHandle_t sdMutex;
 
 #define CS 5
 #define MOSI 23
 #define MISO 19
 #define CLK 18
-
-SemaphoreHandle_t sdFileMutex;
 
 //Audio parameter
 #define I2S_BCK  26
@@ -26,27 +31,26 @@ SemaphoreHandle_t sdFileMutex;
 #define I2S_DATA 22
 #define I2S_PORT I2S_NUM_0
 
-#define FRAME_SIZE 64
+#define FRAME_FORMAT int16_t
+#define MONO_SIZE 32
 #define QUEUE_SIZE 128
+#define FRAME_SIZE (MONO_SIZE * 2)
 #define SAMPLE_RATE 20000
+#define SD_SECONDS_PER_FILE 20
 
 struct __attribute__((packed)) AudioPacket {
     char     deviceId[16];
     uint16_t length;
-    int32_t  samples[FRAME_SIZE]; 
+    uint16_t sequence = 0;
+    FRAME_FORMAT samples[FRAME_SIZE]; 
 };
 
+AudioPacket payload;
+
 volatile uint32_t queueDrops = 0;
-static int32_t ring[QUEUE_SIZE][FRAME_SIZE];
-
-static volatile uint16_t writeIdx = 0;
-static volatile uint16_t readIdx = 0;
-static volatile uint16_t count = 0;
-
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 //WiFi/UDP parameters
-WiFiClient client;
+WiFiUDP client;
 IPAddress serverIp;
 char ssid[64];
 char password[64];
@@ -55,8 +59,8 @@ char deviceId[16];
 
 //Scheduling parametes
 char schedulingMode[64];
-uint16_t durationMinutes = 0;
-uint16_t periodMinutes = 0;
+uint32_t durationMs = 0;
+uint32_t periodMs = 0;
 
 //I2S parameters
 int32_t i2sBuffer[FRAME_SIZE];
@@ -83,7 +87,6 @@ i2s_pin_config_t pins = {
 #define WAKE_GPIO GPIO_NUM_0
 
 bool InitSD() {
-  if (!xSemaphoreTake(sdFileMutex, pdMS_TO_TICKS(100))) return false;
 
   bool ok = false;
   if (SD.begin(CS)) {
@@ -91,24 +94,19 @@ bool InitSD() {
     if (f) { f.close(); ok = true; }
   }
 
-  xSemaphoreGive(sdFileMutex);
   return ok;
 }
 
 bool getScheduleInfo() {
   String data;
 
-  if (!xSemaphoreTake(sdFileMutex, pdMS_TO_TICKS(100))) return false;
-
   File file = SD.open("/Schedule/Schedule.json");
   if (!file) {
     Serial.println("could not find schedule file");
-    xSemaphoreGive(sdFileMutex);
     return false;
   }
   data = file.readString();
   file.close();
-  xSemaphoreGive(sdFileMutex);
 
   JsonDocument doc;
   if (deserializeJson(doc, data)) return false;
@@ -119,34 +117,31 @@ bool getScheduleInfo() {
     if (schedule.isNull() || schedule.size() == 0) {
       strlcpy(schedulingMode, "constant", sizeof(schedulingMode));
     } else {
-      durationMinutes = schedule[0]["durationMinutes"];
-      periodMinutes   = schedule[0]["periodMinutes"];
-      if (durationMinutes == 0 || periodMinutes == 0) {
+      durationMs = ((uint32_t)schedule[0]["durationMinutes"]) * 60000UL;
+      periodMs   = ((uint32_t)schedule[0]["periodMinutes"]) * 60000UL;
+      if (durationMs == 0 || periodMs == 0) {
         strlcpy(schedulingMode, "constant", sizeof(schedulingMode));
+      }
+      else if (durationMs >= periodMs) {
+        strlcpy(schedulingMode, "constant", sizeof(schedulingMode));
+      } else {
+        sleepMs = (periodMs - durationMs);
       }
     }
   }
-
-  Serial.printf("Mode: %s\n", schedulingMode);
-  Serial.printf("durationMinutes: %d\n", durationMinutes);
-  Serial.printf("periodMinutes: %d\n", periodMinutes);
   return true;
 }
 
 bool getNetworkInfo() {
   String data;
 
-  if (!xSemaphoreTake(sdFileMutex, pdMS_TO_TICKS(100))) return false;
-
   File file = SD.open("/Network/Network.json");
   if (!file) {
     Serial.println("could not find network file");
-    xSemaphoreGive(sdFileMutex);
     return false;
   }
   data = file.readString();
   file.close();
-  xSemaphoreGive(sdFileMutex);
 
   JsonDocument doc;
   if (deserializeJson(doc, data)) return false;
@@ -158,39 +153,13 @@ bool getNetworkInfo() {
   serverIp.fromString(targetIP);
 
   return true;
-}
 
-void pushFrame(int32_t *frame) {
-  portENTER_CRITICAL(&mux);
-  if (count == QUEUE_SIZE) {
-    readIdx = (readIdx + 1) % QUEUE_SIZE;
-    count--;
-    queueDrops++;
-  }
-  int idx = writeIdx;
-  writeIdx = (writeIdx + 1) % QUEUE_SIZE;
-  count++;
-  portEXIT_CRITICAL(&mux);
-
-  memcpy(ring[idx], frame, (FRAME_SIZE) * sizeof(int32_t));
-}
-
-bool popFrame(int32_t *dst) {
-  portENTER_CRITICAL(&mux);
-  if (count == 0) { portEXIT_CRITICAL(&mux); return false; }
-  int idx = readIdx;
-  readIdx = (readIdx + 1) % QUEUE_SIZE;
-  count--;
-  portEXIT_CRITICAL(&mux);
-
-  memcpy(dst, ring[idx], (FRAME_SIZE) * sizeof(int32_t));
-  return true;
 }
 
 float phase = 0.0f;
 float modPhase = 0.0f;
 
-void generateWail(int32_t* buffer, int samples)
+void generateWail(FRAME_FORMAT* buffer, int samples)
 {
     for (int i = 0; i < samples; i += 2)
     {
@@ -208,19 +177,16 @@ void generateWail(int32_t* buffer, int samples)
         if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
         if (modPhase > 2.0f * M_PI) modPhase -= 2.0f * M_PI;
 
-        buffer[i] = (int32_t)(val * 60000000.0f);
+        buffer[i] = (FRAME_FORMAT)(val * 32767.0f);
         buffer[i + 1] = buffer[i];
     }
 }
 
 void audioProcessTask(void *pv)
 {
-    int32_t local32[FRAME_SIZE];
+    static FRAME_FORMAT local32[FRAME_SIZE];
 
-    const TickType_t periodTicks =
-    // FRAME_SIZE is total int32 values, but generateWail() fills stereo pairs.
-    // So one buffer contains FRAME_SIZE / 2 samples per channel.
-    pdMS_TO_TICKS(1000.0f * FRAME_SIZE / SAMPLE_RATE);
+    const TickType_t periodTicks = pdMS_TO_TICKS(1000.0f * FRAME_SIZE / SAMPLE_RATE);
 
     TickType_t wakeTime = xTaskGetTickCount();
 
@@ -234,127 +200,123 @@ void audioProcessTask(void *pv)
 
         generateWail(local32, FRAME_SIZE);
 
-        pushFrame(local32);
+        if (!xQueueSend(udpQueue, local32, 0)) {
+          queueDrops++;
+        }
 
         vTaskDelayUntil(&wakeTime, periodTicks);
     }
 }
-bool tcpConnected = false;
-void connectTCP()
-{
-    if (tcpConnected && client.connected()) return;
 
-    client.stop();
-    if (client.connect(serverIp, TARGET_PORT))
-    {
-        tcpConnected = true;
-        Serial.println("TCP connected");
-    }
-    else
-    {
-        tcpConnected = false;
-        Serial.println("TCP connect failed");
-    }
+void sinkUDP(FRAME_FORMAT* frame) {
+  payload.length = FRAME_SIZE * sizeof(FRAME_FORMAT);
+  payload.sequence++;
+  memset(payload.deviceId, 0, sizeof(payload.deviceId));
+  strncpy(payload.deviceId, deviceId, sizeof(payload.deviceId) - 1);
+  memcpy(payload.samples, frame, sizeof(payload.samples));
+  client.beginPacket(serverIp, PORT);
+  client.write((uint8_t*)&payload, 24); // header only
+  client.write((uint8_t*)frame, FRAME_SIZE * sizeof(int16_t));
+  client.endPacket();
 }
+
+void sinkSD(FRAME_FORMAT* frame) {
+  static uint32_t frameCounter = 0;
+  static File soundFile;
+  static File idxFile;
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+  if (!soundFileOpen) {
+      char fileName[64];
+      idxFile = SD.open(idxFileName, FILE_READ);
+      if (idxFile) {
+        if (idxFile.size() == sizeof(uint32_t)) {
+          idxFile.read((uint8_t*)&fileIdx, sizeof(uint32_t));
+        }
+        idxFile.close();
+      } else {
+        fileIdx = 0;
+      }
+
+      snprintf(fileName, sizeof(fileName),
+                "/missed_transmissions/audio_%u.raw", fileIdx++); 
+      soundFile = SD.open(fileName, FILE_WRITE);
+      soundFileOpen = soundFile;
+      if (!soundFileOpen) {
+          Serial.println("SD: failed to open file");
+          xSemaphoreGive(sdMutex);
+          return;
+      }
+
+      frameCounter = 0;
+      Serial.printf("SD: writing to %s\n", fileName);
+    }
+
+    soundFile.write((uint8_t*)frame, FRAME_SIZE * sizeof(FRAME_FORMAT));
+    frameCounter++;
+
+    if (frameCounter >= (SD_SECONDS_PER_FILE * SAMPLE_RATE * 2) / FRAME_SIZE) {
+      soundFile.flush();
+      soundFile.close();
+      soundFileOpen = false;
+      idxFile = SD.open(idxFileName, FILE_WRITE);
+      idxFile.seek(0);
+      idxFile.write((uint8_t*)&fileIdx, sizeof(uint32_t));
+      idxFile.flush();
+      idxFile.close();
+      frameCounter = 0;
+      Serial.println("SD: file rotated");
+    }
+    xSemaphoreGive(sdMutex);
+}
+
 
 void sendTask(void *pv)
 {
-  int32_t frame[FRAME_SIZE];
-  File    localFile;
-  uint32_t frameCounter = 0;
-
-  AudioPacket payload;
-  payload.length = FRAME_SIZE * sizeof(int32_t);
-
+  static FRAME_FORMAT frame[FRAME_SIZE];
   while (true)
   {
-      if (!sdReady)
-      {
-          vTaskDelay(pdMS_TO_TICKS(100));
-          continue;
+      if (!sdReady) {
+        vTaskDelay(1);
+        continue;
       }
 
-      if (!popFrame(frame))
+      if (xQueueReceive(udpQueue, frame, portMAX_DELAY) == pdTRUE)
       {
-          vTaskDelay(pdMS_TO_TICKS(1));
-          continue;
-      }
-
-      if (!client.connected())
-      {
-        memset(payload.deviceId, 0, sizeof(payload.deviceId));
-        strncpy(payload.deviceId, deviceId, sizeof(payload.deviceId) - 1);
-
-
-        memcpy(payload.samples, frame, sizeof(payload.samples));
-
-        size_t written = client.write((uint8_t*)&payload, sizeof(payload));
-
-        if (written != sizeof(payload))
-        {
-            Serial.println("TCP write failed");
-            client.stop();
-            tcpConnected = false;
+        if (WiFi.isConnected()) {
+          sinkUDP(frame);
+          vTaskDelay(pdMS_TO_TICKS(10));
+        } else { 
+          sinkSD(frame);
         }
-      } else {
-        if (!localFile) {
-          char fileName[64];
-          if (xSemaphoreTake(sdFileMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-              continue; 
-          }
-
-          SD.mkdir("/missed_transmissions");
-          snprintf(fileName, sizeof(fileName),
-                    "/missed_transmissions/audio_%u.raw", fileIdx++);
-          localFile = SD.open(fileName, FILE_WRITE);
-
-          xSemaphoreGive(sdFileMutex);
-
-          if (!localFile) {
-              Serial.println("SD: failed to open file");
-              vTaskDelay(pdMS_TO_TICKS(500));
-              continue;
-          }
-
-          frameCounter = 0;
-          Serial.printf("SD: writing to %s\n", fileName);
       }
-
-      localFile.write((uint8_t*)frame, FRAME_SIZE * sizeof(int32_t));
-      frameCounter++;
-
-      if (frameCounter >= SD_FRAMES_PER_FILE) {
-          localFile.flush();
-          localFile.close();
-          frameCounter = 0;
-          Serial.println("SD: file rotated");
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(1);
   }
 }
 
 void setup()
 {
     Serial.begin(115200);
-
     pinMode(CS, OUTPUT);
-
     SPI.begin(CLK, MISO, MOSI, CS);
-
     i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
     i2s_set_pin(I2S_PORT, &pins);
-
     pinMode(WAKE_GPIO, INPUT_PULLUP);
 
-    sdFileMutex = xSemaphoreCreateMutex();
+    cycleStart = 0;
+    sdReady = false;
+    sdLastCheck = 0;
+    udpQueue = xQueueCreate(QUEUE_SIZE, sizeof(FRAME_FORMAT) * FRAME_SIZE);
+
+    WiFi.setSleep(false);
+
+    sdMutex = xSemaphoreCreateMutex();
 
     xTaskCreatePinnedToCore(
         audioProcessTask,
         "audio",
-        12288,
+        12288 ,
         NULL,
-        3,
+        2,
         NULL,
         0
     );
@@ -362,36 +324,39 @@ void setup()
     xTaskCreatePinnedToCore(
         sendTask,
         "send",
-        8192,
+        12288,
         NULL,
-        2,
+        3,
         NULL,
         1
     );
 }
 
 void loop() {
-  // --- SD card hotplug ---
-  if (xSemaphoreTake(sdFileMutex, pdMS_TO_TICKS(100))) {
-    if (sdReady && (!SD.exists("/"))) {
-      Serial.println("SD card removed!");
-      sdReady = false;
-      if (WiFi.status() == WL_CONNECTED) { 
-        WiFi.disconnect(false, false); 
+  if (sdReady) {
+      if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          if (!SD.exists("/")) {
+              sdReady = false;
+              xSemaphoreGive(sdMutex);
+              if (WiFi.status() == WL_CONNECTED) WiFi.disconnect(false, false);
+          } else {
+              xSemaphoreGive(sdMutex);
+          }
       }
-    }
-    xSemaphoreGive(sdFileMutex);
-  } 
+  }
 
   if (!sdReady && (millis() - sdLastCheck >= 2000)) {
     sdLastCheck = millis();
-    if (InitSD()) {
-      Serial.println("SD card connected!");
-      sdReady = true;
-      getNetworkInfo();
-      getScheduleInfo();
-    } else {
-      Serial.println("Waiting for SD card...");
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (InitSD()) {
+            sdReady = true;
+            getNetworkInfo();
+            getScheduleInfo();
+            if (!SD.exists("/missed_transmissions")) SD.mkdir("/missed_transmissions");
+        } else {
+            Serial.println("Waiting for SD card...");
+        }
+        xSemaphoreGive(sdMutex);
     }
   }
 
@@ -409,25 +374,20 @@ void loop() {
             WiFi.begin(ssid, password);
         }
     }
+    
 
-    if (WiFi.isConnected() && !client.connected())
-    {
-      tcpConnected = false;
-      connectTCP();
-    }
     // --- Sampling schedule ---
     if (strcmp(schedulingMode, "sampling") == 0) {
-      static uint32_t cycleStart = 0;
       uint32_t now = millis();
-      uint32_t periodMs   = (uint32_t)periodMinutes   * 60000UL;
-      uint32_t durationMs = (uint32_t)durationMinutes * 60000UL;
 
-      if (cycleStart == 0) cycleStart = now;  // first run init
+      if (!cycleStarted) {
+        cycleStart = now;  // first run init
+        cycleStarted = true;
+      }
 
       uint32_t elapsed = now - cycleStart;
 
       if (elapsed >= durationMs) {
-        uint32_t sleepMs = periodMs - durationMs;
           if (WiFi.status() == WL_CONNECTED) { 
             WiFi.disconnect(true); 
           }
@@ -444,10 +404,13 @@ void loop() {
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint > 1000) {
       lastPrint = millis();
-      Serial.printf("Mode: %s | WiFi %s | Queue: %d | Drops: %d\n",
+      Serial.printf("Mode: %s | WiFi %s | Queue: %d | Drops: %d, RSSI %d\n",
                     schedulingMode,
                     WiFi.isConnected() ? "Connected" : "Disconnected",
-                    count, queueDrops);
+                    uxQueueMessagesWaiting(udpQueue),
+                    queueDrops,
+                    WiFi.RSSI()
+      );
     }
   }
 }
