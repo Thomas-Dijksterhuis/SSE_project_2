@@ -4,50 +4,86 @@
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <WiFiUdp.h>
+#include <atomic>
 
-//SD card parameters
-int32_t fileIdx = 0;
-volatile bool sdReady = false;
-uint32_t sdLastCheck = 0;
-const char* idxFileName = "/missed_transmissions/file_index";
-uint32_t sleepMs = 0;
-uint32_t cycleStart = 0;
-bool cycleStarted = false;
-bool soundFileOpen = false;
+//Pin define
+#define RED_GPIO 4
+#define BLUE_GPIO 15
+#define GREEN_GPIO 2
+#define WAKE_GPIO GPIO_NUM_13
 
-#define PORT 50000
+#define SPI_CS 5
+#define SPI_MOSI 23
+#define SPI_MISO 19
+#define SPI_CLK 18
 
-QueueHandle_t udpQueue;
-SemaphoreHandle_t sdMutex;
-
-#define CS 5
-#define MOSI 23
-#define MISO 19
-#define CLK 18
-
-//Audio parameter
 #define I2S_BCK  26
 #define I2S_WS   25
 #define I2S_DATA 22
 #define I2S_PORT I2S_NUM_0
 
+//Frame info
 #define FRAME_FORMAT int16_t
-#define MONO_SIZE 32
-#define QUEUE_SIZE 128
+#define MONO_SIZE 128
+#define UDP_QUEUE_SIZE 64
 #define FRAME_SIZE (MONO_SIZE * 2)
+#define FRAME_BYTES (sizeof(FRAME_FORMAT) * FRAME_SIZE)
 #define SAMPLE_RATE 20000
 #define SD_SECONDS_PER_FILE 20
+
+#define PORT 50000
+
+struct __attribute__((packed)) WavHeader {
+  char riff[4] = {'R','I','F','F'};
+  uint32_t chunkSize;
+  char wave[4] = {'W','A','V','E'};
+
+  char fmt[4] = {'f','m','t',' '};
+  uint32_t subchunk1Size = 16;
+  uint16_t audioFormat = 1;
+  uint16_t numChannels = 1;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+
+  char data[4] = {'d','a','t','a'};
+  uint32_t subchunk2Size;
+};
 
 struct __attribute__((packed)) AudioPacket {
     char     deviceId[16];
     uint16_t length;
-    uint16_t sequence = 0;
-    FRAME_FORMAT samples[FRAME_SIZE]; 
+    uint32_t sequence = 0;
 };
 
+typedef enum ledMode {
+  LEDMODE_STARTING,
+  LEDMODE_NO_SD,
+  LEDMODE_SD,
+  LEDMODE_WIFI,
+};
+
+//SD card parameters
+uint32_t fileIdx = 0;
 AudioPacket payload;
+uint32_t sdLastCheck = 0;
+const char* idxFileName = "/missed_transmissions/file_index";
+uint32_t sleepMs = 0;
+uint32_t cycleStart = 0;
+bool cycleStarted = false;
+
+bool udpStarted = false;
+File soundFile;
+File idxFile;
+QueueHandle_t udpQueue;
+TaskHandle_t mainTaskHandle = NULL;
 
 volatile uint32_t queueDrops = 0;
+
+std::atomic<bool> sdReady = false;
+std::atomic<ledMode> currentLed = LEDMODE_STARTING;
+std::atomic<bool> systemActive = false;
 
 //WiFi/UDP parameters
 WiFiUDP client;
@@ -83,18 +119,41 @@ i2s_pin_config_t pins = {
   .data_in_num = I2S_DATA
 };
 
-//Deep sleep parameters
-#define WAKE_GPIO GPIO_NUM_0
+void setLed(ledMode mode){
+  switch (mode) {
+    case LEDMODE_STARTING: {
+      digitalWrite(RED_GPIO, 1);
+      digitalWrite(GREEN_GPIO, 1);
+      digitalWrite(BLUE_GPIO, 0);
+      break;
+    }
+    case LEDMODE_NO_SD: {
+      digitalWrite(RED_GPIO, 1);
+      digitalWrite(GREEN_GPIO, 0);
+      digitalWrite(BLUE_GPIO, 0);
+      break;      
+    }
+    case LEDMODE_SD: {
+      digitalWrite(RED_GPIO, 0);
+      digitalWrite(GREEN_GPIO, 0);
+      digitalWrite(BLUE_GPIO, 1);
+      break;      
+    }
+    case LEDMODE_WIFI: {
+      digitalWrite(RED_GPIO, 0);
+      digitalWrite(GREEN_GPIO, 1);
+      digitalWrite(BLUE_GPIO, 0);
+      break;      
+    }                     
+  }
+}
 
 bool InitSD() {
-
-  bool ok = false;
-  if (SD.begin(CS)) {
-    File f = SD.open("/");
-    if (f) { f.close(); ok = true; }
+  SD.end();
+  if (SD.begin(SPI_CS)) {
+    return SD.exists("/.connected");
   }
-
-  return ok;
+  return false;
 }
 
 bool getScheduleInfo() {
@@ -153,7 +212,6 @@ bool getNetworkInfo() {
   serverIp.fromString(targetIP);
 
   return true;
-
 }
 
 float phase = 0.0f;
@@ -182,139 +240,223 @@ void generateWail(FRAME_FORMAT* buffer, int samples)
     }
 }
 
-void audioProcessTask(void *pv)
+void writeWavHeader(File &file,
+                    uint32_t sampleRate,
+                    uint16_t bitsPerSample,
+                    uint16_t channels,
+                    uint32_t dataSize)
 {
-    static FRAME_FORMAT local32[FRAME_SIZE];
+    WavHeader h;
 
-    const TickType_t periodTicks = pdMS_TO_TICKS(1000.0f * FRAME_SIZE / SAMPLE_RATE);
+    h.sampleRate = sampleRate;
+    h.bitsPerSample = bitsPerSample;
+    h.numChannels = channels;
 
-    TickType_t wakeTime = xTaskGetTickCount();
+    h.byteRate = sampleRate * channels * bitsPerSample / 8;
+    h.blockAlign = channels * bitsPerSample / 8;
 
-    while (true) {
+    h.subchunk2Size = dataSize;
+    h.chunkSize = 36 + dataSize;
 
-        if (!sdReady) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            wakeTime = xTaskGetTickCount();
-            continue;
-        }
-
-        generateWail(local32, FRAME_SIZE);
-
-        if (!xQueueSend(udpQueue, local32, 0)) {
-          queueDrops++;
-        }
-
-        vTaskDelayUntil(&wakeTime, periodTicks);
-    }
+    file.seek(0);
+    file.write((uint8_t*)&h, sizeof(h));
+    file.flush();
 }
 
 void sinkUDP(FRAME_FORMAT* frame) {
-  payload.length = FRAME_SIZE * sizeof(FRAME_FORMAT);
+  if (soundFile){
+    soundFile.flush();
+    uint32_t dataSize = 0;
+    if (soundFile.size() > sizeof(WavHeader)) {
+        dataSize = soundFile.size() - sizeof(WavHeader);
+    }
+
+    writeWavHeader(
+        soundFile,
+        SAMPLE_RATE,
+        16,
+        2,
+        dataSize
+    );
+    soundFile.close();
+  }
+  currentLed = LEDMODE_WIFI;
+  payload.length = FRAME_BYTES;
   payload.sequence++;
   memset(payload.deviceId, 0, sizeof(payload.deviceId));
   strncpy(payload.deviceId, deviceId, sizeof(payload.deviceId) - 1);
-  memcpy(payload.samples, frame, sizeof(payload.samples));
   client.beginPacket(serverIp, PORT);
-  client.write((uint8_t*)&payload, 24); // header only
+  client.write((uint8_t*)&payload, sizeof(payload)); // header only
   client.write((uint8_t*)frame, FRAME_SIZE * sizeof(int16_t));
   client.endPacket();
 }
 
 void sinkSD(FRAME_FORMAT* frame) {
   static uint32_t frameCounter = 0;
-  static File soundFile;
-  static File idxFile;
-  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
-  if (!soundFileOpen) {
-      char fileName[64];
-      idxFile = SD.open(idxFileName, FILE_READ);
-      if (idxFile) {
-        if (idxFile.size() == sizeof(uint32_t)) {
-          idxFile.read((uint8_t*)&fileIdx, sizeof(uint32_t));
-        }
-        idxFile.close();
-      } else {
-        fileIdx = 0;
+  if (!sdReady ) {
+    if (soundFile) { 
+      soundFile.close();
+    }
+    return;
+  }
+  currentLed = LEDMODE_SD;
+  if (!soundFile) {
+    char fileName[64];
+    idxFile = SD.open(idxFileName, FILE_READ);
+    if (idxFile) {
+      if (idxFile.size() == sizeof(uint32_t)) {
+        idxFile.read((uint8_t*)&fileIdx, sizeof(uint32_t));
       }
-
-      snprintf(fileName, sizeof(fileName),
-                "/missed_transmissions/audio_%u.raw", fileIdx++); 
-      soundFile = SD.open(fileName, FILE_WRITE);
-      soundFileOpen = soundFile;
-      if (!soundFileOpen) {
-          Serial.println("SD: failed to open file");
-          xSemaphoreGive(sdMutex);
-          return;
-      }
-
-      frameCounter = 0;
-      Serial.printf("SD: writing to %s\n", fileName);
+      idxFile.close();
+    } else {
+      fileIdx = 0;
+    }
+    snprintf(fileName, sizeof(fileName),
+              "/missed_transmissions/audio_%u.wav", fileIdx);
+    SD.remove(fileName);
+    soundFile = SD.open(fileName, FILE_WRITE);
+    if (!soundFile) {
+        Serial.println("SD: failed to open file");
+        return;
     }
 
-    soundFile.write((uint8_t*)frame, FRAME_SIZE * sizeof(FRAME_FORMAT));
-    frameCounter++;
-
-    if (frameCounter >= (SD_SECONDS_PER_FILE * SAMPLE_RATE * 2) / FRAME_SIZE) {
-      soundFile.flush();
-      soundFile.close();
-      soundFileOpen = false;
-      idxFile = SD.open(idxFileName, FILE_WRITE);
+    soundFile.seek(sizeof(WavHeader));
+    fileIdx++;
+    SD.remove(idxFileName);
+    idxFile = SD.open(idxFileName, FILE_WRITE);
+    if (idxFile) {
       idxFile.seek(0);
       idxFile.write((uint8_t*)&fileIdx, sizeof(uint32_t));
       idxFile.flush();
       idxFile.close();
-      frameCounter = 0;
-      Serial.println("SD: file rotated");
     }
-    xSemaphoreGive(sdMutex);
+    frameCounter = 0;
+    Serial.printf("SD: writing to %s\n", fileName);
+  }
+
+  size_t n = soundFile.write((uint8_t*)frame, FRAME_BYTES);
+  if (n != FRAME_BYTES) {
+      Serial.println("SD write failed");
+  }
+  frameCounter++;
+
+  if (frameCounter >= (SD_SECONDS_PER_FILE * SAMPLE_RATE) / MONO_SIZE) {
+    uint32_t dataSize = 0;
+    soundFile.flush();
+    if (soundFile.size() > sizeof(WavHeader)) {
+        dataSize = soundFile.size() - sizeof(WavHeader);
+    }
+
+    writeWavHeader(
+        soundFile,
+        SAMPLE_RATE,
+        16,
+        2,
+        dataSize
+    );
+    
+    soundFile.close();
+    frameCounter = 0;
+    Serial.println("SD: file rotated");
+  }
 }
 
+void audioProcessTask(void *pv)
+{
+  static FRAME_FORMAT local32[FRAME_SIZE];
+
+  const TickType_t periodTicks = pdMS_TO_TICKS(1000.0f * FRAME_SIZE / SAMPLE_RATE);
+
+  TickType_t wakeTime = xTaskGetTickCount();
+
+  while (true) {
+
+    if (!sdReady || !systemActive) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        wakeTime = xTaskGetTickCount();
+        continue;
+    } 
+
+    generateWail(local32, FRAME_SIZE);
+
+    if (!xQueueSend(udpQueue, local32, 0)) {
+      queueDrops++;
+    }
+
+    vTaskDelayUntil(&wakeTime, periodTicks);
+  }
+}
 
 void sendTask(void *pv)
 {
   static FRAME_FORMAT frame[FRAME_SIZE];
   while (true)
   {
-      if (!sdReady) {
-        vTaskDelay(1);
-        continue;
-      }
+    if (!sdReady) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
 
-      if (xQueueReceive(udpQueue, frame, portMAX_DELAY) == pdTRUE)
-      {
+    if (!systemActive) {
+      // drain whatever's left before signalling sleep is safe
+      while (xQueueReceive(udpQueue, frame, 0) == pdTRUE) {
         if (WiFi.isConnected()) {
           sinkUDP(frame);
-          vTaskDelay(pdMS_TO_TICKS(10));
         } else { 
           sinkSD(frame);
         }
       }
-    vTaskDelay(1);
+      xTaskNotifyGive(mainTaskHandle);
+      vTaskSuspend(NULL);
+      continue;
+    }
+
+    if (xQueueReceive(udpQueue, frame, 0) == pdTRUE) {
+        if (WiFi.isConnected()) {
+          sinkUDP(frame);
+        } else { 
+          sinkSD(frame);
+        }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 void setup()
 {
     Serial.begin(115200);
-    pinMode(CS, OUTPUT);
-    SPI.begin(CLK, MISO, MOSI, CS);
+    pinMode(SPI_CS, OUTPUT);
+    SPI.begin(SPI_CLK, SPI_MISO, SPI_MOSI, SPI_CS);
     i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
     i2s_set_pin(I2S_PORT, &pins);
+
     pinMode(WAKE_GPIO, INPUT_PULLUP);
+    pinMode(RED_GPIO, OUTPUT);
+    pinMode(GREEN_GPIO, OUTPUT);
+    pinMode(BLUE_GPIO, OUTPUT);
+
+    currentLed = LEDMODE_STARTING;
 
     cycleStart = 0;
     sdReady = false;
     sdLastCheck = 0;
-    udpQueue = xQueueCreate(QUEUE_SIZE, sizeof(FRAME_FORMAT) * FRAME_SIZE);
+    udpQueue = xQueueCreate(UDP_QUEUE_SIZE, FRAME_BYTES);
+    mainTaskHandle = xTaskGetCurrentTaskHandle();
 
     WiFi.setSleep(false);
 
-    sdMutex = xSemaphoreCreateMutex();
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    switch(wakeup_reason) {
+      case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+      case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+      default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
 
     xTaskCreatePinnedToCore(
         audioProcessTask,
         "audio",
-        12288 ,
+        8192 ,
         NULL,
         2,
         NULL,
@@ -326,56 +468,61 @@ void setup()
         "send",
         12288,
         NULL,
-        3,
+        2,
         NULL,
         1
     );
+
+    systemActive = true;
 }
 
 void loop() {
   if (sdReady) {
-      if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          if (!SD.exists("/")) {
-              sdReady = false;
-              xSemaphoreGive(sdMutex);
-              if (WiFi.status() == WL_CONNECTED) WiFi.disconnect(false, false);
-          } else {
-              xSemaphoreGive(sdMutex);
-          }
+      bool connected = SD.exists("/.connected");
+
+      if (!connected) {
+        sdReady = false;
+        if (WiFi.status() == WL_CONNECTED) {
+          WiFi.disconnect(false, false);
+        }
+        if (soundFile) {
+          soundFile.close();
+        }
       }
   }
-
   if (!sdReady && (millis() - sdLastCheck >= 2000)) {
-    sdLastCheck = millis();
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (InitSD()) {
-            sdReady = true;
-            getNetworkInfo();
-            getScheduleInfo();
-            if (!SD.exists("/missed_transmissions")) SD.mkdir("/missed_transmissions");
-        } else {
-            Serial.println("Waiting for SD card...");
-        }
-        xSemaphoreGive(sdMutex);
-    }
+      sdLastCheck = millis();
+      if (InitSD()) {
+          getNetworkInfo();
+          getScheduleInfo();
+          sdReady = true;
+          if (!SD.exists("/missed_transmissions")) SD.mkdir("/missed_transmissions");
+      } else {
+          Serial.println("Waiting for SD card...");
+          currentLed = LEDMODE_NO_SD;
+      }
   }
-
+  setLed(currentLed);
   if (sdReady) {
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED){
+      udpStarted = false;
 
-        static uint32_t lastAttempt = 0;
+      static uint32_t lastAttempt = 0;
 
-        if (millis() - lastAttempt > 10000) {
+      if (millis() - lastAttempt > 10000) {
 
-            lastAttempt = millis();
+        lastAttempt = millis();
 
-            Serial.printf("Connecting WiFi to %s\n", ssid);
+        Serial.printf("Connecting WiFi to %s\n", ssid);
 
-            WiFi.begin(ssid, password);
-        }
+        WiFi.disconnect(false, false);
+        WiFi.begin(ssid, password);
+      }
+    } 
+    if (WiFi.status() == WL_CONNECTED && !udpStarted) {
+      client.begin(PORT);
+      udpStarted = true;
     }
-    
-
     // --- Sampling schedule ---
     if (strcmp(schedulingMode, "sampling") == 0) {
       uint32_t now = millis();
@@ -388,13 +535,41 @@ void loop() {
       uint32_t elapsed = now - cycleStart;
 
       if (elapsed >= durationMs) {
+          systemActive = false;
+          ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
           if (WiFi.status() == WL_CONNECTED) { 
+            payload.sequence++;
+            payload.length = 0;
+            memset(payload.deviceId, 0, sizeof(payload.deviceId));
+            strncpy(payload.deviceId, deviceId, sizeof(payload.deviceId) - 1);
+            client.beginPacket(serverIp, PORT);
+            client.write((uint8_t*)&payload, sizeof(payload));
+            client.endPacket();
             WiFi.disconnect(true); 
           }
-          WiFi.mode(WIFI_OFF);
-          esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+        WiFi.mode(WIFI_OFF);
 
+        if (soundFile){
+          soundFile.flush();
+          uint32_t dataSize = 0;
+          if (soundFile.size() > sizeof(WavHeader)) {
+              dataSize = soundFile.size() - sizeof(WavHeader);
+          }
+
+          writeWavHeader(
+              soundFile,
+              SAMPLE_RATE,
+              16,
+              2,
+              dataSize
+          );
+          
+          soundFile.close();
+        }
+        xQueueReset(udpQueue);
+        esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
         esp_sleep_enable_ext0_wakeup(WAKE_GPIO, 0);
+        Serial.println("Going to sleep");
         Serial.flush();
         esp_deep_sleep_start();
       }
@@ -411,6 +586,7 @@ void loop() {
                     queueDrops,
                     WiFi.RSSI()
       );
+
     }
   }
 }
