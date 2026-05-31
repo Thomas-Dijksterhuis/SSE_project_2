@@ -12,7 +12,6 @@ import queue
 import traceback
 
 
-from collections import deque
 recorded_samples = deque()
 
 credentials = json.load(open('PI_code/credentials.json'))
@@ -52,10 +51,8 @@ last_sequence = {}
 
 db_queue = queue.Queue()
 
-def _save_wav(device_id,
-             samples,
-             start_timestamp,
-             stop_timestamp):
+
+def _save_wav(device_id, samples, start_timestamp, stop_timestamp):
 
     if not samples:
         return
@@ -77,26 +74,20 @@ def _save_wav(device_id,
     date_dir.mkdir(parents=True, exist_ok=True)
 
     start_label = start_timestamp.strftime("%H%M%S")
-    stop_label = stop_timestamp.strftime("%H%M%S")
+    stop_label  = stop_timestamp.strftime("%H%M%S")
 
     out_path = date_dir / f"{start_label}_{stop_label}.wav"
 
     with wave.open(str(out_path), "wb") as wf:
-
         wf.setnchannels(credentials["recording"]["channels"])
-
-        wf.setsampwidth(
-            credentials["recording"]["sample_width_bytes"]
-        )
-
-        wf.setframerate(
-            credentials["recording"]["sample_rate"]
-        )
-
+        wf.setsampwidth(credentials["recording"]["sample_width_bytes"])
+        wf.setframerate(credentials["recording"]["sample_rate"])
         wf.writeframes(pcm.tobytes())
+
 
 def save_wav(device_id, samples, start_timestamp, stop_timestamp):
     db_queue.put((device_id, list(samples), start_timestamp, stop_timestamp))
+
 
 def db_worker():
     while True:
@@ -107,7 +98,9 @@ def db_worker():
             print("Save error:", e)
         db_queue.task_done()
 
+
 threading.Thread(target=db_worker, daemon=True).start()
+
 
 def nlms_step(u, d):
 
@@ -128,6 +121,7 @@ def nlms_step(u, d):
 
     return e
 
+
 def handle_packet(payload, message_time):
 
     global recorded_samples
@@ -139,34 +133,39 @@ def handle_packet(payload, message_time):
     if len(payload) < header_size:
         return
 
-    device_id_raw, length, sequence = struct.unpack_from(
-        "<16sHI",
-        payload,
-        0
-    )
+    device_id_raw, length, sequence = struct.unpack_from("<16sHI", payload, 0)
 
+    # Decode device_id first so it's available for both the stop and audio paths
     device_id = (
         device_id_raw
         .decode("utf-8", errors="ignore")
         .rstrip("\x00")
         .strip()
-    )
+    ) or "unknown"
 
-    if not device_id:
-        device_id = "unknown"
+    # Stop packet — flush partial buffer and reset state
+    if length == 0:
+        if recorded_samples and file_start_timestamp is not None:
+            chunk = list(recorded_samples)
+            flush_start = file_start_timestamp  # capture before clearing
+            recorded_samples.clear()
+            file_start_timestamp = None
+            save_wav(device_id, chunk, flush_start, message_time)
+            print(f"[{device_id}] Sleep signal received, flushed {len(chunk)} samples")
+        last_sequence.pop(device_id, None)
+        return
 
     expected_size = header_size + length
 
-
     if len(payload) != expected_size:
-        print("Invalid packet size")
+        print(f"[{device_id}] Invalid packet size: got {len(payload)}, expected {expected_size}")
         return
 
     if device_id in last_sequence:
         expected = (last_sequence[device_id] + 1) & 0xFFFFFFFF
         if sequence != expected:
             delta = (sequence - expected) & 0xFFFFFFFF
-            print(f"Packet loss from {device_id}: lost={delta}")
+            print(f"[{device_id}] Packet loss: lost={delta}")
 
     last_sequence[device_id] = sequence
 
@@ -175,9 +174,8 @@ def handle_packet(payload, message_time):
     samples = np.frombuffer(frame, dtype=np.int16).astype(np.float64)
     samples /= 32767.0
 
-    left = samples[0::2]
+    left  = samples[0::2]
     right = samples[1::2]
-
 
     for d, u in zip(left, right):
         cleaned = nlms_step(d, u)
@@ -190,38 +188,22 @@ def handle_packet(payload, message_time):
 
         chunk = [recorded_samples.popleft() for _ in range(SAMPLES_PER_FILE)]
 
-        chunk_start_timestamp = file_start_timestamp
+        chunk_start = file_start_timestamp
+        chunk_stop  = chunk_start + FILE_DURATION
 
-        file_stop_timestamp = (
-            chunk_start_timestamp
-            + FILE_DURATION
-        )
+        save_wav(device_id, chunk, chunk_start, chunk_stop)
 
-        save_wav(
-            device_id,
-            chunk,
-            chunk_start_timestamp,
-            file_stop_timestamp
-        )
-
-
-        if recorded_samples:
-            file_start_timestamp = message_time
-        else:
-            file_start_timestamp = None
+        file_start_timestamp = message_time if recorded_samples else None
 
 
 def udp_server(host="0.0.0.0", port=50000):
 
-    server = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_DGRAM
-    )
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     server.setsockopt(
         socket.SOL_SOCKET,
         socket.SO_RCVBUF,
-        1024 * 1024  # 1MB
+        1024 * 1024  # 1 MB
     )
 
     server.bind((host, port))
@@ -229,21 +211,12 @@ def udp_server(host="0.0.0.0", port=50000):
     print(f"UDP server listening on {host}:{port}")
 
     while True:
-
         try:
-
             payload, addr = server.recvfrom(65535)
-
-            handle_packet(
-                payload,
-                datetime.datetime.now()
-            )
-
+            handle_packet(payload, datetime.datetime.now())
         except Exception as e:
             print("UDP receive error:", e)
             traceback.print_exc()
-
-
 
 
 if __name__ == "__main__":
