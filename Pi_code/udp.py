@@ -84,6 +84,8 @@ def _save_wav(device_id, samples, start_timestamp, stop_timestamp):
         wf.setframerate(credentials["recording"]["sample_rate"])
         wf.writeframes(pcm.tobytes())
 
+    print(f"[{device_id}] Saved {len(samples)} samples to {out_path}")
+
 
 def save_wav(device_id, samples, start_timestamp, stop_timestamp):
     db_queue.put((device_id, list(samples), start_timestamp, stop_timestamp))
