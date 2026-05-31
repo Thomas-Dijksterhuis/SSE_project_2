@@ -545,6 +545,7 @@ void loop() {
             client.beginPacket(serverIp, PORT);
             client.write((uint8_t*)&payload, sizeof(payload));
             client.endPacket();
+            delay(1000);
             WiFi.disconnect(true); 
           }
         WiFi.mode(WIFI_OFF);
