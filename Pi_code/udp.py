@@ -130,12 +130,31 @@ def handle_packet(payload, message_time):
     global file_start_timestamp
     global last_sequence
 
-    header_size = 22
+    header_size = 46
 
     if len(payload) < header_size:
         return
 
-    device_id_raw, length, sequence = struct.unpack_from("<16sHI", payload, 0)
+    device_id_raw, timestamp_raw, length, sequence = struct.unpack_from("<16s24sHI", payload, 0)
+
+    # try to decode device-provided timestamp (fallback to None)
+    device_timestamp = None
+    try:
+        timestamp_str = (
+            timestamp_raw.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+        )
+        if timestamp_str:
+            try:
+                # ISO 8601 like: 2026-06-02T12:34:56.789
+                device_timestamp = datetime.datetime.fromisoformat(timestamp_str)
+            except Exception:
+                try:
+                    # common fallback format: 'YYYY-MM-DD HH:MM:SS.sss'
+                    device_timestamp = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
+                except Exception:
+                    device_timestamp = None
+    except Exception:
+        device_timestamp = None
 
     # Decode device_id first so it's available for both the stop and audio paths
     device_id = (
@@ -147,12 +166,13 @@ def handle_packet(payload, message_time):
 
     # Stop packet — flush partial buffer and reset state
     if length == 0:
-        if recorded_samples and file_start_timestamp is not None:
+        if recorded_samples:
             chunk = list(recorded_samples)
             flush_start = file_start_timestamp  # capture before clearing
             recorded_samples.clear()
             file_start_timestamp = None
-            save_wav(device_id, chunk, flush_start, message_time)
+            # prefer device timestamp for stop time if available
+            save_wav(device_id, chunk, flush_start, device_timestamp or message_time)
             print(f"[{device_id}] Sleep signal received, flushed {len(chunk)} samples")
         last_sequence.pop(device_id, None)
         return
@@ -183,15 +203,16 @@ def handle_packet(payload, message_time):
         cleaned = nlms_step(d, u)
         recorded_samples.append(cleaned)
 
+    # use device timestamp for file start when available, otherwise receive time
     if file_start_timestamp is None:
-        file_start_timestamp = message_time
+        file_start_timestamp = device_timestamp or message_time
 
     while len(recorded_samples) >= SAMPLES_PER_FILE:
 
         chunk = [recorded_samples.popleft() for _ in range(SAMPLES_PER_FILE)]
 
         chunk_start = file_start_timestamp
-        chunk_stop  = chunk_start + FILE_DURATION
+        chunk_stop = chunk_start + FILE_DURATION
 
         save_wav(device_id, chunk, chunk_start, chunk_stop)
 
