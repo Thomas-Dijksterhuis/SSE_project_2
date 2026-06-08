@@ -1,6 +1,5 @@
 #include <Arduino.h>
-#include "driver/spi_slave.h"
-#include "driver/gpio.h"
+#include "driver/i2s.h"
 #include <WiFi.h>
 #include <SD.h>
 #include <ArduinoJson.h>
@@ -19,39 +18,39 @@
 #define SPI_SD_MISO 17
 #define SPI_SD_CLK 19
 
-#define SPI_AUDIO_CS 32
-#define SPI_AUDIO_MOSI 25
-#define SPI_AUDIO_MISO 27
-#define SPI_AUDIO_CLK 26
+#define I2S_RX_BCK_PIN   26
+#define I2S_RX_WS_PIN    25
+#define I2S_RX_DATA_PIN  27
+#define I2S_RX_PORT   I2S_NUM_1
 
 //Frame info
 #define FRAME_FORMAT int16_t
 #define SAMPLES_PER_CHANNEL 128
 #define UDP_QUEUE_SIZE 64
 #define CHANNELS 2
-#define FRAME_SAMPLES (SAMPLES_PER_CHANNEL * 2)
+#define FRAME_SAMPLES (SAMPLES_PER_CHANNEL * CHANNELS)
 #define FRAME_BYTES (sizeof(FRAME_FORMAT) * FRAME_SAMPLES)
 #define SAMPLE_RATE 20000
 #define SD_SECONDS_PER_FILE 20
 
-int16_t* rxBuffer = nullptr;
-
-spi_bus_config_t buscfg = {
-  .mosi_io_num     = SPI_AUDIO_MOSI,
-  .miso_io_num     = SPI_AUDIO_MISO,
-  .sclk_io_num     = SPI_AUDIO_CLK,
-  .quadwp_io_num   = -1,
-  .quadhd_io_num   = -1,
-  .max_transfer_sz = FRAME_BYTES,
+i2s_config_t rx_config = {
+  .mode                 = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX),
+  .sample_rate          = SAMPLE_RATE,
+  .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
+  .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT,
+  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+  .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count        = 4,
+  .dma_buf_len          = SAMPLES_PER_CHANNEL,
+  .use_apll             = false,
+  .tx_desc_auto_clear   = false
 };
 
-spi_slave_interface_config_t slvcfg = {
-  .spics_io_num   = SPI_AUDIO_CS,
-  .flags          = 0,
-  .queue_size     = 3,
-  .mode           = 0,
-  .post_setup_cb  = NULL,
-  .post_trans_cb  = NULL,
+i2s_pin_config_t rx_pins = {
+  .bck_io_num   = I2S_RX_BCK_PIN,
+  .ws_io_num    = I2S_RX_WS_PIN,
+  .data_out_num = I2S_PIN_NO_CHANGE,
+  .data_in_num  = I2S_RX_DATA_PIN
 };
 
 #define PORT 50000
@@ -64,7 +63,7 @@ struct __attribute__((packed)) WavHeader {
   char fmt[4] = { 'f', 'm', 't', ' ' };
   uint32_t subchunk1Size = 16;
   uint16_t audioFormat = 1;
-  uint16_t numChannels;
+  uint16_t numChannels = 2;
   uint32_t sampleRate;
   uint32_t byteRate;
   uint16_t blockAlign;
@@ -128,8 +127,6 @@ char schedulingMode[64];
 uint32_t durationMs = 0;
 uint32_t periodMs = 0;
 
-SPIClass spiSd(VSPI);
-
 void setDevice(deviceMode mode) {
   switch (mode) {
     case DEVICEMODE_OFF:
@@ -172,7 +169,7 @@ void setDevice(deviceMode mode) {
 
 bool InitSD() {
     SD.end();
-    bool begun = SD.begin(SPI_SD_CS, spiSd);
+    bool begun = SD.begin(SPI_SD_CS);
     Serial.printf("SD.begin: %s\n", begun ? "OK" : "FAIL");
     if (begun) {
         return SD.exists("/.connected");
@@ -227,11 +224,8 @@ bool getNetworkInfo() {
   JsonDocument doc;
   if (deserializeJson(doc, data)) return false;
 
-  //strlcpy(ssid,     doc["SSID"]               | "", sizeof(ssid));
-  //strlcpy(password, doc["Password"]           | "", sizeof(password));
-
-  strlcpy(ssid, "CiscoE1200", sizeof(ssid));
-  strlcpy(password, "CiscoE1200", sizeof(password));
+  strlcpy(ssid,     doc["SSID"]               | "", sizeof(ssid));
+  strlcpy(password, doc["Password"]           | "", sizeof(password));
   strlcpy(targetIP, doc["ReceiverIpAddress"] | "", sizeof(targetIP));
   strlcpy(deviceId, doc["DeviceId"] | "", sizeof(deviceId));
   serverIp.fromString(targetIP);
@@ -439,7 +433,7 @@ void sinkSD(FRAME_FORMAT* frame) {
 }
 
 void syncTime() {
-  if (millis() - lastNtpAttempt > 10000) {
+  if (millis() - lastNtpAttempt > 30000) {
     lastNtpAttempt = millis();
 
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org");
@@ -452,51 +446,24 @@ void syncTime() {
   }
 }
 
-float phase = 0.0f;
-float modPhase = 0.0f;
-
-void generateWail(FRAME_FORMAT* buffer, int samples) {
-  for (int i = 0; i < samples; i += 2) {
-    float lfo = 0.5f + 0.5f * sinf(modPhase);
-
-    float freq = 300.0f + lfo * 1200.0f;
-
-    float amp = 0.3f + 0.7f * lfo;
-
-    float val = sinf(phase) * amp;
-
-    phase += 2.0f * M_PI * freq / SAMPLE_RATE;
-    modPhase += 2.0f * M_PI * 0.5f / SAMPLE_RATE;
-
-    if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
-    if (modPhase > 2.0f * M_PI) modPhase -= 2.0f * M_PI;
-
-    buffer[i] = (FRAME_FORMAT)(val * 32767.0f);
-    buffer[i + 1] = buffer[i];
-  }
-}
-
 void audioProcessTask(void *pv) {
-  static FRAME_FORMAT local32[FRAME_SAMPLES];
-
-  const TickType_t periodTicks = pdMS_TO_TICKS(1000.0f * FRAME_SAMPLES / (SAMPLE_RATE * CHANNELS));
-
-  TickType_t wakeTime = xTaskGetTickCount();
+  static FRAME_FORMAT frame[FRAME_SAMPLES];
 
   while (true) {
+    size_t bytesRead = 0;
+    i2s_read(I2S_RX_PORT,
+           frame,
+           FRAME_BYTES,
+           &bytesRead,
+           portMAX_DELAY);
+
     if (!sdReady || !systemActive) {
         vTaskDelay(pdMS_TO_TICKS(1));
-        wakeTime = xTaskGetTickCount();
         continue;
     } 
-
-    generateWail(local32, FRAME_SAMPLES);
-
-    if (!xQueueSend(udpQueue, local32, 0)) {
+    if (!xQueueSend(udpQueue, frame, 0)) {
       queueDrops++;
     }
-
-    vTaskDelayUntil(&wakeTime, periodTicks);
   }
 }
 
@@ -532,16 +499,13 @@ void sendTask(void* pv) {
 
 void setup() {
   Serial.begin(115200);
-  
-  esp_err_t ret = spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH1);
-  if (ret != ESP_OK) {
-    Serial.print("SPI slave init failed: ");
-    Serial.println(ret);
-    return;
-  }
+
+  i2s_driver_install(I2S_RX_PORT, &rx_config, 0, NULL);
+  i2s_set_pin(I2S_RX_PORT, &rx_pins);
+  i2s_zero_dma_buffer(I2S_RX_PORT);
 
   pinMode(SPI_SD_CS, OUTPUT);
-  spiSd.begin(SPI_SD_CLK, SPI_SD_MISO, SPI_SD_MOSI, SPI_SD_CS);
+  SPI.begin(SPI_SD_CLK, SPI_SD_MISO, SPI_SD_MOSI, SPI_SD_CS);
 
   pinMode(WAKE_GPIO, INPUT_PULLUP);
   pinMode(RED_GPIO, OUTPUT);
@@ -561,17 +525,6 @@ void setup() {
   mainTaskHandle = xTaskGetCurrentTaskHandle();
 
   WiFi.setSleep(false);
-
-  gpio_set_pull_mode((gpio_num_t)SPI_AUDIO_MOSI, GPIO_PULLUP_ONLY);
-  gpio_set_pull_mode((gpio_num_t)SPI_AUDIO_CLK, GPIO_PULLUP_ONLY);
-  gpio_set_pull_mode((gpio_num_t)SPI_AUDIO_CS, GPIO_PULLUP_ONLY);
-
-  rxBuffer = (int16_t*)heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_DMA);
-
-  if (!rxBuffer) {
-    Serial.println("Failed to allocate DMA buffers");
-    return;
-  }
 
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch (wakeup_reason) {
@@ -648,8 +601,7 @@ void loop() {
         udpStarted = true;
       }
       if (!timeSynced) {
-        syncTime();
-        timeSynced = true;
+        syncTime();   
       }
     } else {
       currentDevice = DEVICEMODE_SD;
