@@ -1,246 +1,372 @@
-import struct
-import numpy as np
-from collections import deque
-import wave
-from pathlib import Path
-import psycopg2
+import argparse
 import datetime
 import json
-import socket
-import threading
 import queue
+import socket
+import struct
+import threading
 import traceback
+import wave
+from collections import deque
+from pathlib import Path
 
+import numpy as np
+import psycopg2
 
-recorded_samples = deque()
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-credentials = json.load(open('PI_code/credentials.json'))
+with open("PI_code/credentials.json") as f:
+    credentials = json.load(f)
 
+SAMPLE_RATE      = credentials["recording"]["sample_rate"]
+SAVE_SECONDS     = credentials["recording"]["save_seconds"]
+CHANNELS         = credentials["recording"]["channels"]
+SAMPLE_WIDTH     = credentials["recording"]["sample_width_bytes"]
 
-conn = psycopg2.connect(
-    dbname=credentials["database"]["db_name"],
-    user=credentials["database"]["user"],
-    password=credentials["database"]["password"],
-    host=credentials["database"]["host"],
-    port=credentials["database"]["Port"]
-)
+SAMPLES_PER_FILE = SAMPLE_RATE * SAVE_SECONDS
+FILE_DURATION    = datetime.timedelta(seconds=SAVE_SECONDS)
 
-cur = conn.cursor()
-
-SAMPLES_PER_FILE = (
-    credentials["recording"]["sample_rate"]
-    * credentials["recording"]["save_seconds"]
-)
-
-FILE_DURATION = datetime.timedelta(
-    seconds=credentials["recording"]["save_seconds"]
-)
+LIVE_BUFFER_MS            = 300
+LIVE_BUFFER_SAMPLES       = max(1, int(SAMPLE_RATE * LIVE_BUFFER_MS / 1000))
+LIVE_PLAYBACK_FRAME_MS    = 256
+LIVE_PLAYBACK_FRAME_SAMPLES = max(1, int(SAMPLE_RATE * LIVE_PLAYBACK_FRAME_MS / 1000))
+LIVE_MIXER_BUFFER         = max(256, min(1024, LIVE_PLAYBACK_FRAME_SAMPLES * 2))
 
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-M = 64
+# NLMS
+M  = 64
 MU = 0.01
 
-file_start_timestamp = None
+# ---------------------------------------------------------------------------
+# Per-device state
+# ---------------------------------------------------------------------------
 
-w = np.zeros(M)
-x_hist = deque([0.0] * M, maxlen=M)
+class DeviceState:
+    """All mutable state scoped to a single device ID."""
 
-last_sequence = {}
+    def __init__(self):
+        self.lock              = threading.Lock()
+        self.recorded_samples  = deque()
+        self.file_start_ts     = None
+        self.last_sequence     = None
 
-db_queue = queue.Queue()
+        # NLMS
+        self.w      = np.zeros(M)
+        self.x_hist = deque([0.0] * M, maxlen=M)
+
+    def nlms_step(self, u: float, d: float) -> float:
+        """
+        u = reference / noise signal (right channel from mic wiring)
+        d = desired  / primary signal (left channel from mic wiring)
+        Returns the error signal (cleaned audio).
+        """
+        self.x_hist.append(u)
+        x    = np.array(self.x_hist)
+        y    = np.dot(self.w, x)
+        e    = d - y
+        norm = np.dot(x, x) + 1e-8
+        self.w += (MU / norm) * e * x
+        return e
 
 
-def _save_wav(device_id, samples, start_timestamp, stop_timestamp):
+_device_states: dict[str, DeviceState] = {}
+_device_states_lock = threading.Lock()
 
+
+def get_device_state(device_id: str) -> DeviceState:
+    with _device_states_lock:
+        if device_id not in _device_states:
+            _device_states[device_id] = DeviceState()
+        return _device_states[device_id]
+
+# ---------------------------------------------------------------------------
+# Database worker
+# ---------------------------------------------------------------------------
+
+db_queue: queue.Queue = queue.Queue()
+
+
+def _make_db_connection():
+    db = credentials["database"]
+    return psycopg2.connect(
+        dbname   = db["db_name"],
+        user     = db["user"],
+        password = db["password"],
+        host     = db["host"],
+        port     = db["Port"],
+    )
+
+
+def _save_wav(conn, device_id: str, samples: list, start_ts: datetime.datetime, stop_ts: datetime.datetime):
     if not samples:
         return
 
-    clipped = np.clip(
-        np.asarray(samples, dtype=np.float64),
-        -1.0,
-        1.0
-    )
+    clipped = np.clip(np.asarray(samples, dtype=np.float64), -1.0, 1.0)
+    pcm     = (clipped * 32767).astype(np.int16)
 
-    pcm = (clipped * 32767).astype(np.int16)
-
-    date_dir = (
-        RECORDINGS_DIR
-        / device_id
-        / str(start_timestamp.date())
-    )
-
+    date_dir = RECORDINGS_DIR / device_id / str(start_ts.date())
     date_dir.mkdir(parents=True, exist_ok=True)
 
-    start_label = start_timestamp.strftime("%H%M%S")
-    stop_label  = stop_timestamp.strftime("%H%M%S")
-
-    out_path = date_dir / f"{start_label}_{stop_label}.wav"
+    out_path = date_dir / f"{start_ts.strftime('%H%M%S')}_{stop_ts.strftime('%H%M%S')}.wav"
 
     with wave.open(str(out_path), "wb") as wf:
-        wf.setnchannels(credentials["recording"]["channels"])
-        wf.setsampwidth(credentials["recording"]["sample_width_bytes"])
-        wf.setframerate(credentials["recording"]["sample_rate"])
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm.tobytes())
 
-    print(f"[{device_id}] Saved {len(samples)} samples to {out_path}")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO audio_recordings (device_id, start_time, stop_time, path)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (device_id, start_ts, stop_ts, str(out_path)),  # pass datetime objects directly
+        )
+    conn.commit()
 
-
-def save_wav(device_id, samples, start_timestamp, stop_timestamp):
-    db_queue.put((device_id, list(samples), start_timestamp, stop_timestamp))
+    print(f"[{device_id}] Saved {len(samples)} samples → {out_path}")
 
 
 def db_worker():
+    """Single writer thread owns the DB connection — no locking needed."""
+    conn = _make_db_connection()
     while True:
-        device_id, samples, start_timestamp, stop_timestamp = db_queue.get()
+        device_id, samples, start_ts, stop_ts = db_queue.get()
         try:
-            _save_wav(device_id, samples, start_timestamp, stop_timestamp)
+            _save_wav(conn, device_id, samples, start_ts, stop_ts)
         except Exception as e:
             print("Save error:", e)
-        db_queue.task_done()
+            traceback.print_exc()
+            # Attempt reconnect on next item
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                conn = _make_db_connection()
+            except Exception as reconnect_err:
+                print("DB reconnect failed:", reconnect_err)
+        finally:
+            db_queue.task_done()
 
 
 threading.Thread(target=db_worker, daemon=True).start()
 
 
-def nlms_step(u, d):
+def save_wav(device_id: str, samples: list, start_ts: datetime.datetime, stop_ts: datetime.datetime):
+    """Enqueue a save task (non-blocking, copies the sample list)."""
+    db_queue.put((device_id, list(samples), start_ts, stop_ts))
 
-    global w
-    global x_hist
+# ---------------------------------------------------------------------------
+# Live playback
+# ---------------------------------------------------------------------------
 
-    x_hist.append(u)
-
-    x = np.array(x_hist)
-
-    y = np.dot(w, x)
-
-    e = d - y
-
-    norm = np.dot(x, x) + 1e-8
-
-    w += (MU / norm) * e * x
-
-    return e
+livePlaybackEnabled = threading.Event()
+livePlaybackQueue: queue.Queue = queue.Queue(maxsize=100)
+livePendingSamples: deque      = deque()
+livePendingLock                = threading.Lock()
 
 
-def handle_packet(payload, message_time):
+def enqueueLiveSamples(samples: list):
+    if not livePlaybackEnabled.is_set():
+        return
 
-    global recorded_samples
-    global file_start_timestamp
-    global last_sequence
+    with livePendingLock:
+        livePendingSamples.extend(samples)
 
-    header_size = 46
+        while len(livePendingSamples) >= LIVE_PLAYBACK_FRAME_SAMPLES:
+            chunk = [livePendingSamples.popleft() for _ in range(LIVE_PLAYBACK_FRAME_SAMPLES)]
+            try:
+                livePlaybackQueue.put_nowait(chunk)
+            except queue.Full:
+                print("Live playback buffer full, dropping audio chunk")
 
-    if len(payload) < header_size:
+
+def livePlaybackWorker():
+    try:
+        import pygame
+
+        pygame.mixer.pre_init(
+            frequency = SAMPLE_RATE,
+            size      = -16,
+            channels  = 1,
+            buffer    = LIVE_MIXER_BUFFER,
+        )
+        pygame.mixer.init()
+    except Exception as e:
+        print("Live listen disabled:", e)
+        return
+
+    print(
+        f"Live listen enabled — {LIVE_BUFFER_MS} ms start buffer "
+        f"({LIVE_BUFFER_SAMPLES} samples), {LIVE_PLAYBACK_FRAME_MS} ms chunks"
+    )
+
+    mixer_channels = (pygame.mixer.get_init() or (None, None, 1))[2]
+    liveChannel     = None
+    primedSamples   = []
+    primedCount     = 0
+    primed          = False
+
+    while True:
+        chunk = livePlaybackQueue.get()
+        try:
+            pcm = np.clip(np.asarray(chunk, dtype=np.float64), -1.0, 1.0)
+            pcm = (pcm * 32767).astype(np.int16)
+
+            audio = pcm if mixer_channels == 1 else np.column_stack([pcm] * mixer_channels)
+
+            if not primed:
+                primedSamples.append(audio)
+                primedCount += len(audio)
+
+                if primedCount < LIVE_BUFFER_SAMPLES:
+                    continue
+
+                # We have enough — flush accumulated frames then mark primed
+                audio  = np.concatenate(primedSamples, axis=0)
+                primedSamples.clear()
+                primedCount = 0
+                primed = True
+
+            sound = pygame.sndarray.make_sound(audio)
+
+            if liveChannel is None or not liveChannel.get_busy():
+                liveChannel = sound.play()
+            else:
+                liveChannel.queue(sound)
+        except Exception as e:
+            print("Live playback error:", e)
+        finally:
+            livePlaybackQueue.task_done()
+
+# ---------------------------------------------------------------------------
+# Packet handling
+# ---------------------------------------------------------------------------
+
+HEADER_SIZE = 46  # <16s 24s H I>
+
+
+def _parse_timestamp(raw: bytes) -> datetime.datetime | None:
+    text = raw.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+    if not text:
+        return None
+    for fmt in (None, "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.datetime.fromisoformat(text) if fmt is None else datetime.datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def handle_packet(payload: bytes, message_time: datetime.datetime):
+    if len(payload) < HEADER_SIZE:
         return
 
     device_id_raw, timestamp_raw, length, sequence = struct.unpack_from("<16s24sHI", payload, 0)
 
-    # try to decode device-provided timestamp (fallback to None)
-    device_timestamp = None
-    try:
-        timestamp_str = (
-            timestamp_raw.decode("utf-8", errors="ignore").rstrip("\x00").strip()
-        )
-        if timestamp_str:
-            try:
-                # ISO 8601 like: 2026-06-02T12:34:56.789
-                device_timestamp = datetime.datetime.fromisoformat(timestamp_str)
-            except Exception:
-                try:
-                    # common fallback format: 'YYYY-MM-DD HH:MM:SS.sss'
-                    device_timestamp = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
-                except Exception:
-                    device_timestamp = None
-    except Exception:
-        device_timestamp = None
+    device_id     = device_id_raw.decode("utf-8", errors="ignore").rstrip("\x00").strip() or "unknown"
+    device_ts     = _parse_timestamp(timestamp_raw)
+    effective_ts  = device_ts or message_time
 
-    # Decode device_id first so it's available for both the stop and audio paths
-    device_id = (
-        device_id_raw
-        .decode("utf-8", errors="ignore")
-        .rstrip("\x00")
-        .strip()
-    ) or "unknown"
+    state = get_device_state(device_id)
 
-    # Stop packet — flush partial buffer and reset state
-    if length == 0:
-        if recorded_samples:
-            chunk = list(recorded_samples)
-            flush_start = file_start_timestamp  # capture before clearing
-            recorded_samples.clear()
-            file_start_timestamp = None
-            # prefer device timestamp for stop time if available
-            save_wav(device_id, chunk, flush_start, device_timestamp or message_time)
-            print(f"[{device_id}] Sleep signal received, flushed {len(chunk)} samples")
-        last_sequence.pop(device_id, None)
-        return
+    with state.lock:
+        # --- Sleep / flush signal ---
+        if length == 0:
+            if state.recorded_samples:
+                chunk       = list(state.recorded_samples)
+                flush_start = state.file_start_ts
+                state.recorded_samples.clear()
+                state.file_start_ts = None
+                save_wav(device_id, chunk, flush_start, effective_ts)
+                print(f"[{device_id}] Sleep signal — flushed {len(chunk)} samples")
+            state.last_sequence = None
+            return
 
-    expected_size = header_size + length
+        # --- Validate size ---
+        expected_size = HEADER_SIZE + length
+        if len(payload) != expected_size:
+            print(f"[{device_id}] Bad packet size: got {len(payload)}, expected {expected_size}")
+            return
 
-    if len(payload) != expected_size:
-        print(f"[{device_id}] Invalid packet size: got {len(payload)}, expected {expected_size}")
-        return
+        # --- Sequence check ---
+        if state.last_sequence is not None:
+            expected_seq = (state.last_sequence + 1) & 0xFFFF_FFFF
+            if sequence != expected_seq:
+                lost = (sequence - expected_seq) & 0xFFFF_FFFF
+                print(f"[{device_id}] Packet loss: {lost} packet(s) missing")
+        state.last_sequence = sequence
 
-    if device_id in last_sequence:
-        expected = (last_sequence[device_id] + 1) & 0xFFFFFFFF
-        if sequence != expected:
-            delta = (sequence - expected) & 0xFFFFFFFF
-            print(f"[{device_id}] Packet loss: lost={delta}")
+        # --- Decode samples ---
+        raw_samples = np.frombuffer(payload[HEADER_SIZE:], dtype=np.int16).astype(np.float64)
+        raw_samples /= 32767.0
 
-    last_sequence[device_id] = sequence
+        # Left = primary (desired), Right = reference/noise — verify against your wiring
+        left  = raw_samples[0::2]
+        right = raw_samples[1::2]
 
-    frame = payload[header_size:]
+        cleaned_chunk = []
+        for d, u in zip(left, right):
+            # d = desired (left/primary), u = reference (right/noise)
+            cleaned = state.nlms_step(u, d)
+            state.recorded_samples.append(cleaned)
+            cleaned_chunk.append(cleaned)
 
-    samples = np.frombuffer(frame, dtype=np.int16).astype(np.float64)
-    samples /= 32767.0
+        enqueueLiveSamples(cleaned_chunk)
 
-    left  = samples[0::2]
-    right = samples[1::2]
+        if state.file_start_ts is None:
+            state.file_start_ts = effective_ts
 
-    for d, u in zip(left, right):
-        cleaned = nlms_step(d, u)
-        recorded_samples.append(cleaned)
+        # --- Flush complete files ---
+        while len(state.recorded_samples) >= SAMPLES_PER_FILE:
+            chunk = [state.recorded_samples.popleft() for _ in range(SAMPLES_PER_FILE)]
+            save_wav(device_id, chunk, state.file_start_ts, effective_ts)
+            state.file_start_ts = effective_ts
 
-    # use device timestamp for file start when available, otherwise receive time
-    if file_start_timestamp is None:
-        file_start_timestamp = device_timestamp or message_time
+# ---------------------------------------------------------------------------
+# UDP server
+# ---------------------------------------------------------------------------
 
-    while len(recorded_samples) >= SAMPLES_PER_FILE:
-
-        chunk = [recorded_samples.popleft() for _ in range(SAMPLES_PER_FILE)]
-
-        chunk_start = file_start_timestamp
-        chunk_stop = chunk_start + FILE_DURATION
-
-        save_wav(device_id, chunk, chunk_start, chunk_stop)
-
-        file_start_timestamp = message_time if recorded_samples else None
-
-
-def udp_server(host="0.0.0.0", port=50000):
+def udp_server():
+    conn_cfg = credentials["connection"]
+    host     = conn_cfg["ip_address"]
+    port     = conn_cfg["port"]
 
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    server.setsockopt(
-        socket.SOL_SOCKET,
-        socket.SO_RCVBUF,
-        1024 * 1024  # 1 MB
-    )
-
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096 * 4096)
     server.bind((host, port))
 
     print(f"UDP server listening on {host}:{port}")
 
     while True:
         try:
-            payload, addr = server.recvfrom(65535)
+            payload, _addr = server.recvfrom(65535)
             handle_packet(payload, datetime.datetime.now())
         except Exception as e:
             print("UDP receive error:", e)
             traceback.print_exc()
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="UDP audio receiver")
+    parser.add_argument(
+        "--listen-live",
+        action="store_true",
+        help="Play received audio with a 300 ms start buffer",
+    )
+    args = parser.parse_args()
+
+    if args.listen_live:
+        livePlaybackEnabled.set()
+        threading.Thread(target=livePlaybackWorker, daemon=True).start()
+
     udp_server()
