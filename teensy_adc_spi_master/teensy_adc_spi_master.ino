@@ -1,12 +1,12 @@
 #include <driver/i2s.h>
 
 // I2S pin definitions (matching original SPI pins)
-#define I2S_BCK_PIN   26   // Was SPI_AUDIO_CLK
-#define I2S_WS_PIN    25   // Was SPI_AUDIO_MOSI
-#define I2S_DATA_PIN  27   // Was SPI_AUDIO_MISO
+#define I2S_BCK_PIN   26
+#define I2S_WS_PIN    25
+#define I2S_DATA_PIN  27
 
 #define SAMPLE_RATE   20000
-#define BUFFER_SIZE   128
+#define BUFFER_SIZE   256
 #define CHANNELS      2
 #define FRAME_SAMPLES (BUFFER_SIZE * CHANNELS)
 
