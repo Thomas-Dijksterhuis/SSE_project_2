@@ -7,6 +7,8 @@
 #include <WiFiUdp.h>
 #include <atomic>
 
+#define DEBUG
+
 //Pin define
 #define RED_GPIO 4
 #define BLUE_GPIO 15
@@ -25,8 +27,8 @@
 
 //Frame info
 #define FRAME_FORMAT int16_t
-#define SAMPLES_PER_CHANNEL 128
-#define UDP_QUEUE_SIZE 64
+#define SAMPLES_PER_CHANNEL 256
+#define UDP_QUEUE_SIZE 32
 #define CHANNELS 2
 #define FRAME_SAMPLES (SAMPLES_PER_CHANNEL * CHANNELS)
 #define FRAME_BYTES (sizeof(FRAME_FORMAT) * FRAME_SAMPLES)
@@ -84,6 +86,7 @@ enum deviceMode {
   DEVICEMODE_OFF,
   DEVICEMODE_STARTING,
   DEVICEMODE_NO_SD,
+  DEVICEMODE_SD_ERROR,
   DEVICEMODE_SD,
   DEVICEMODE_WIFI,
 };
@@ -98,7 +101,7 @@ volatile bool cycleStarted = false;
 File soundFile;
 File idxFile;
 
-uint16_t setupFinished = 0;
+uint32_t setupFinished = 0;
 
 const char* transmissionFolder = "/missed_transmissions";
 std::atomic<bool> sdReady = false;
@@ -150,6 +153,13 @@ void setDevice(deviceMode mode) {
         digitalWrite(BLUE_GPIO, 0);
         break;
       }
+    case DEVICEMODE_SD_ERROR:
+      {
+        digitalWrite(RED_GPIO, 1);
+        digitalWrite(GREEN_GPIO, 0);
+        digitalWrite(BLUE_GPIO, 1);
+        break;
+      }
     case DEVICEMODE_SD:
       {
         digitalWrite(RED_GPIO, 0);
@@ -169,25 +179,23 @@ void setDevice(deviceMode mode) {
 
 bool InitSD() {
     SD.end();
-    bool begun = SD.begin(SPI_SD_CS);
-    Serial.printf("SD.begin: %s\n", begun ? "OK" : "FAIL");
-    if (begun) {
+    if (SD.begin(SPI_SD_CS)) {
         return SD.exists("/.connected");
     }
     return false;
 }
+
 bool getScheduleInfo() {
   String data;
 
-  File file = SD.open("/Schedule/Schedule.json");
+  File file = SD.open("/Schedule.json");
   if (!file) {
-    Serial.println("could not find schedule file");
     return false;
   }
   data = file.readString();
   file.close();
 
-  JsonDocument doc;
+  StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, data)) return false;
 
   strlcpy(schedulingMode, doc["mode"] | "", sizeof(schedulingMode));
@@ -213,15 +221,14 @@ bool getScheduleInfo() {
 bool getNetworkInfo() {
   String data;
 
-  File file = SD.open("/Network/Network.json");
+  File file = SD.open("/Network.json");
   if (!file) {
-    Serial.println("could not find network file");
     return false;
   }
   data = file.readString();
   file.close();
 
-  JsonDocument doc;
+  StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, data)) return false;
 
   strlcpy(ssid,     doc["SSID"]               | "", sizeof(ssid));
@@ -254,7 +261,7 @@ void writeWavHeader(File& file, uint32_t sampleRate, uint16_t bitsPerSample, uin
 void enableDeepSleep() {
   systemActive = false;
   setDevice(DEVICEMODE_OFF);
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
   if (WiFi.status() == WL_CONNECTED) {
     payload.sequence++;
     payload.length = 0;
@@ -295,7 +302,6 @@ void enableDeepSleep() {
     esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
   }
   esp_sleep_enable_ext0_wakeup(WAKE_GPIO, 0);
-  Serial.println("Going to sleep");
   Serial.flush();
   esp_deep_sleep_start();
 }
@@ -394,9 +400,10 @@ void sinkSD(FRAME_FORMAT* frame) {
     SD.remove(fileName);
     soundFile = SD.open(fileName, FILE_WRITE);
     if (!soundFile) {
-      Serial.println("SD: failed to open file");
       return;
     }
+
+    soundFile.seek(sizeof(WavHeader));
 
     if (!timeSynced) {
       fileIdx++;
@@ -410,12 +417,17 @@ void sinkSD(FRAME_FORMAT* frame) {
       }
     }
     frameCounter = 0;
+    #ifdef DEBUG
     Serial.printf("SD: writing to %s\n", fileName);
+    #endif
   }
-
+  
   size_t n = soundFile.write((uint8_t*)frame, FRAME_BYTES);
   if (n != FRAME_BYTES) {
     Serial.println("SD write failed");
+    soundFile.close();
+    sdReady = false;
+    return;
   }
   frameCounter++;
 
@@ -428,21 +440,15 @@ void sinkSD(FRAME_FORMAT* frame) {
     writeWavHeader(soundFile, SAMPLE_RATE, 16, 2, dataSize);
     soundFile.close();
     frameCounter = 0;
-    Serial.println("SD: file rotated");
   }
 }
 
 void syncTime() {
   if (millis() - lastNtpAttempt > 30000) {
     lastNtpAttempt = millis();
-
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org");
-
-    time_t now = time(nullptr);
-    if (now > 1700000000) {
-      timeSynced = true;
-      Serial.println("Time synced");
-    }
+    struct tm timeinfo;
+    timeSynced = getLocalTime(&timeinfo, 100);
   }
 }
 
@@ -451,11 +457,10 @@ void audioProcessTask(void *pv) {
 
   while (true) {
     size_t bytesRead = 0;
-    i2s_read(I2S_RX_PORT,
-           frame,
-           FRAME_BYTES,
-           &bytesRead,
-           portMAX_DELAY);
+    if (i2s_read(I2S_RX_PORT, frame, FRAME_BYTES, &bytesRead, pdMS_TO_TICKS(20)) != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
 
     if (!sdReady || !systemActive) {
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -471,10 +476,6 @@ void sendTask(void* pv) {
   static FRAME_FORMAT frame[FRAME_SAMPLES];
   while (true) {
     if (!systemActive) {
-      if (!sdReady) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-        continue;
-      }
       while (xQueueReceive(udpQueue, frame, 0) == pdTRUE) {
         if (WiFi.isConnected()) {
           sinkUDP(frame);
@@ -487,13 +488,19 @@ void sendTask(void* pv) {
       continue;
     }
 
-    if (xQueueReceive(udpQueue, frame, pdMS_TO_TICKS(6)) == pdTRUE) {
+    if (!sdReady) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    if (xQueueReceive(udpQueue, frame, 0) == pdTRUE) {
       if (WiFi.isConnected()) {
         sinkUDP(frame);
       } else {
         sinkSD(frame);
       }
     }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -518,6 +525,8 @@ void setup() {
 
   setDevice(DEVICEMODE_STARTING);
 
+  timeSynced = false;
+  cycleStarted = false;
   cycleStart = 0;
   sdReady = false;
   sdLastCheck = 0;
@@ -526,12 +535,14 @@ void setup() {
 
   WiFi.setSleep(false);
 
+  #ifdef DEBUG
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch (wakeup_reason) {
     case ESP_SLEEP_WAKEUP_EXT0: Serial.println("Wakeup caused by external signal using RTC_IO"); break;
     case ESP_SLEEP_WAKEUP_TIMER: Serial.println("Wakeup caused by timer"); break;
     default: Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
   }
+  #endif
 
   systemActive = true;
   xTaskCreatePinnedToCore(audioProcessTask, "audio", 8192, NULL, 2, NULL, 0);
@@ -548,9 +559,7 @@ void loop() {
     enableDeepSleep();
   }
   if (sdReady) {
-    bool connected = SD.exists("/.connected");
-
-    if (!connected) {
+    if (!SD.exists("/.connected")) {
       sdReady = false;
       timeSynced = false;
       if (WiFi.status() == WL_CONNECTED) {
@@ -563,13 +572,20 @@ void loop() {
   }
   if (!sdReady && (millis() - sdLastCheck >= 2000)) {
     sdLastCheck = millis();
+
     if (InitSD()) {
-      getNetworkInfo();
-      getScheduleInfo();
-      sdReady = true;
+      if (!getNetworkInfo()) {
+        currentDevice = DEVICEMODE_SD_ERROR;
+      } else if (!getScheduleInfo()) {
+        currentDevice = DEVICEMODE_SD_ERROR;
+      } else {
+        sdReady = true;
+      }
       if (!SD.exists("/missed_transmissions")) SD.mkdir("/missed_transmissions");
     } else {
+      #ifdef DEBUG
       Serial.println("Waiting for SD card...");
+      #endif
       currentDevice = DEVICEMODE_NO_SD;
     }
   }
@@ -579,17 +595,15 @@ void loop() {
   }
   if (sdReady) {
     if (!WiFi.isConnected()) {
-      timeSynced = false;
       udpStarted = false;
 
       static uint32_t lastAttempt = 0;
-
       if (millis() - lastAttempt > 10000) {
 
         lastAttempt = millis();
-
+        #ifdef DEBUG
         Serial.printf("Connecting WiFi to %s\n", ssid);
-
+        #endif
         WiFi.disconnect(false, false);
         WiFi.begin(ssid, password);
       }
@@ -622,7 +636,7 @@ void loop() {
         enableDeepSleep();
       }
     }
-
+    #ifdef DEBUG
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint > 1000) {
       lastPrint = millis();
@@ -632,5 +646,6 @@ void loop() {
                     queueDrops,
                     WiFi.RSSI());
     }
+    #endif
   }
-}
+}  
