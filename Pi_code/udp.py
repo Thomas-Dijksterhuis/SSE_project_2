@@ -12,6 +12,14 @@ from pathlib import Path
 
 import numpy as np
 import psycopg2
+import matplotlib.pyplot as plt
+
+plot_initialized = False
+plot_line = None
+plot_fig = None
+plot_ax = None
+
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -28,6 +36,16 @@ SAMPLE_WIDTH     = credentials["recording"]["sample_width_bytes"]
 SAMPLES_PER_FILE = SAMPLE_RATE * SAVE_SECONDS
 FILE_DURATION    = datetime.timedelta(seconds=SAVE_SECONDS)
 
+RAW_SAVE_SECONDS     = 20
+RAW_SAMPLES_PER_FILE = SAMPLE_RATE * RAW_SAVE_SECONDS
+
+PLOT_SECONDS = 1
+
+plotLeftBuffer = deque(maxlen=SAMPLE_RATE * PLOT_SECONDS)
+plotRightBuffer = deque(maxlen=SAMPLE_RATE * PLOT_SECONDS)
+
+plotLock = threading.Lock()
+
 LIVE_BUFFER_MS            = 300
 LIVE_BUFFER_SAMPLES       = max(1, int(SAMPLE_RATE * LIVE_BUFFER_MS / 1000))
 LIVE_PLAYBACK_FRAME_MS    = 256
@@ -38,8 +56,8 @@ RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # NLMS
-M  = 64
-MU = 0.01
+M = 64
+MU = 0.25
 
 # ---------------------------------------------------------------------------
 # Per-device state
@@ -48,28 +66,35 @@ MU = 0.01
 class DeviceState:
     """All mutable state scoped to a single device ID."""
 
-    def __init__(self):
+    def __init__(self, m: int = M, mu: float = MU):
         self.lock              = threading.Lock()
         self.recorded_samples  = deque()
         self.file_start_ts     = None
         self.last_sequence     = None
 
+        self.input_samples     = deque()
+        self.desired_samples   = deque()
+        self.input_file_start_ts = None
+
         # NLMS
-        self.w      = np.zeros(M)
-        self.x_hist = deque([0.0] * M, maxlen=M)
+        self.m = m
+        self.mu = mu
+        self.w = np.zeros(self.m)
+        self.x = np.zeros(self.m)
+        self.idx = 0
 
     def nlms_step(self, u: float, d: float) -> float:
-        """
-        u = reference / noise signal (right channel from mic wiring)
-        d = desired  / primary signal (left channel from mic wiring)
-        Returns the error signal (cleaned audio).
-        """
-        self.x_hist.append(u)
-        x    = np.array(self.x_hist)
-        y    = np.dot(self.w, x)
-        e    = d - y
+        self.x[self.idx] = u
+        self.idx = (self.idx + 1) % len(self.x)
+
+        x = np.roll(self.x, -self.idx)
+
+        y = np.dot(self.w, x)
+        e = d - y
+
         norm = np.dot(x, x) + 1e-8
-        self.w += (MU / norm) * e * x
+        self.w += (self.mu / norm) * e * x
+
         return e
 
 
@@ -80,7 +105,7 @@ _device_states_lock = threading.Lock()
 def get_device_state(device_id: str) -> DeviceState:
     with _device_states_lock:
         if device_id not in _device_states:
-            _device_states[device_id] = DeviceState()
+            _device_states[device_id] = DeviceState(M, MU)
         return _device_states[device_id]
 
 # ---------------------------------------------------------------------------
@@ -89,6 +114,57 @@ def get_device_state(device_id: str) -> DeviceState:
 
 db_queue: queue.Queue = queue.Queue()
 
+def plotWorker():
+    plt.ion()
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    x = np.linspace(
+        -PLOT_SECONDS,
+        0,
+        SAMPLE_RATE * PLOT_SECONDS
+    )
+
+    ax.set_xlabel("Time (s)")
+
+    leftLine, = ax.plot(x, np.zeros_like(x), label="Peizo")
+    rightLine, = ax.plot(x, np.zeros_like(x), label="Microphone")
+
+    ax.set_title("Received Stereo Audio")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+
+    ax.set_xlim(-PLOT_SECONDS, 0)
+
+    y_lim = 1.5/4
+    # Bigger range
+    ax.set_ylim(y_lim, -y_lim)
+
+    ax.grid(True)
+    ax.legend()
+
+    while True:
+
+        with plotLock:
+
+            left = np.array(plotLeftBuffer)
+            right = np.array(plotRightBuffer)
+
+        if len(left):
+
+            leftData = np.zeros(len(x))
+            rightData = np.zeros(len(x))
+
+            leftData[-len(left):] = left
+            rightData[-len(right):] = right
+
+            leftLine.set_ydata(leftData)
+            rightLine.set_ydata(rightData)
+
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+
+        plt.pause(0.05)
 
 def _make_db_connection():
     db = credentials["database"]
@@ -162,11 +238,48 @@ def save_wav(device_id: str, samples: list, start_ts: datetime.datetime, stop_ts
     """Enqueue a save task (non-blocking, copies the sample list)."""
     db_queue.put((device_id, list(samples), start_ts, stop_ts))
 
+
+def save_input_desired_wav(device_id: str, input_samples: list, desired_samples: list, start_ts: datetime.datetime, stop_ts: datetime.datetime):
+    """Save the original left/right channels as separate mono input/desired WAV files."""
+    if not input_samples and not desired_samples:
+        return
+
+    frame_count = min(len(input_samples), len(desired_samples))
+    if frame_count <= 0:
+        return
+
+    input_pcm = (np.clip(np.asarray(input_samples[:frame_count], dtype=np.float64), -1.0, 1.0) * 32767).astype(np.int16)
+    desired_pcm = (np.clip(np.asarray(desired_samples[:frame_count], dtype=np.float64), -1.0, 1.0) * 32767).astype(np.int16)
+
+    date_dir = RECORDINGS_DIR / device_id / str(start_ts.date())
+    date_dir.mkdir(parents=True, exist_ok=True)
+
+    (date_dir / "input").mkdir(parents=True, exist_ok=True)
+    (date_dir / "desired").mkdir(parents=True, exist_ok=True)
+
+    input_path = date_dir / "input" / f"{start_ts.strftime('%H%M%S')}_{stop_ts.strftime('%H%M%S')}_input.wav"
+    desired_path = date_dir / "desired" / f"{start_ts.strftime('%H%M%S')}_{stop_ts.strftime('%H%M%S')}_desired.wav"
+
+    with wave.open(str(input_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(input_pcm.tobytes())
+
+    with wave.open(str(desired_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(desired_pcm.tobytes())
+
+    print(f"[{device_id}] Saved {frame_count} input/desired frames → {input_path} and {desired_path}")
+
 # ---------------------------------------------------------------------------
 # Live playback
 # ---------------------------------------------------------------------------
 
 livePlaybackEnabled = threading.Event()
+saveInputDesiredEnabled = threading.Event()
 livePlaybackQueue: queue.Queue = queue.Queue(maxsize=100)
 livePendingSamples: deque      = deque()
 livePendingLock                = threading.Lock()
@@ -286,6 +399,17 @@ def handle_packet(payload: bytes, message_time: datetime.datetime):
                 state.file_start_ts = None
                 save_wav(device_id, chunk, flush_start, effective_ts)
                 print(f"[{device_id}] Sleep signal — flushed {len(chunk)} samples")
+
+            if saveInputDesiredEnabled.is_set() and state.input_samples and state.desired_samples:
+                input_chunk = list(state.input_samples)
+                desired_chunk = list(state.desired_samples)
+                input_flush_start = state.input_file_start_ts or effective_ts
+                state.input_samples.clear()
+                state.desired_samples.clear()
+                state.input_file_start_ts = None
+                save_input_desired_wav(device_id, input_chunk, desired_chunk, input_flush_start, effective_ts)
+                print(f"[{device_id}] Sleep signal — flushed {min(len(input_chunk), len(desired_chunk))} input/desired frames")
+
             state.last_sequence = None
             return
 
@@ -305,11 +429,28 @@ def handle_packet(payload: bytes, message_time: datetime.datetime):
 
         # --- Decode samples ---
         raw_samples = np.frombuffer(payload[HEADER_SIZE:], dtype=np.int16).astype(np.float64)
-        raw_samples /= 32767.0
+        raw_samples /= 32768.0
 
         # Left = primary (desired), Right = reference/noise — verify against your wiring
         left  = raw_samples[0::2]
         right = raw_samples[1::2]
+
+        with plotLock:
+            plotLeftBuffer.extend(left)
+            plotRightBuffer.extend(right)
+
+        if saveInputDesiredEnabled.is_set():
+            if state.input_file_start_ts is None:
+                state.input_file_start_ts = effective_ts
+
+            state.input_samples.extend(left.tolist())
+            state.desired_samples.extend(right.tolist())
+
+            while len(state.input_samples) >= RAW_SAMPLES_PER_FILE and len(state.desired_samples) >= RAW_SAMPLES_PER_FILE:
+                input_chunk = [state.input_samples.popleft() for _ in range(RAW_SAMPLES_PER_FILE)]
+                desired_chunk = [state.desired_samples.popleft() for _ in range(RAW_SAMPLES_PER_FILE)]
+                save_input_desired_wav(device_id, input_chunk, desired_chunk, state.input_file_start_ts, effective_ts)
+                state.input_file_start_ts = effective_ts
 
         cleaned_chunk = []
         for d, u in zip(left, right):
@@ -363,10 +504,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Play received audio with a 300 ms start buffer",
     )
+    parser.add_argument(
+        "--save-raw-stereo",
+        action="store_true",
+        help="Also save original left/right channels as 20 second input/desired WAV files",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Show real-time plot of received audio",
+    )
     args = parser.parse_args()
 
     if args.listen_live:
         livePlaybackEnabled.set()
         threading.Thread(target=livePlaybackWorker, daemon=True).start()
 
-    udp_server()
+    if args.save_raw_stereo:
+        saveInputDesiredEnabled.set()
+        print(f"Input/desired save enabled — {RAW_SAVE_SECONDS} second files")
+
+    threading.Thread(target=udp_server, daemon=True).start()
+
+    if args.plot:
+        plotWorker()
+    else:
+        while True:
+            try:
+                threading.Event().wait(1)
+            except KeyboardInterrupt:
+                print("Exiting...")
+                break
