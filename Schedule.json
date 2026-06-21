@@ -1,9 +1,0 @@
-{
-    "mode": "sampling",
-    "schedule": [
-        {
-            "durationMinutes": 10,
-            "periodMinutes": 60
-        }
-    ]
-}
