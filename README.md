@@ -19,7 +19,7 @@ The status of these connections can be used for debugging and monitoring the ope
 
 The audio processing task:
 
-- Reads stereo I2S audio data from the ADC connected to the ESP32.
+- Reads stereo UART audio data from the ADC connected to the ESP32.
 - Samples audio at **20 kHz**.
 - Places the captured audio data into a queue for further processing.
 
@@ -212,5 +212,6 @@ The status LED provides a visual indication of the system state.
 | DEVICEMODE_STARTING | Yellow| System is starting up |
 | DEVICEMODE_NO_SD | Red | The system could not detect an SD card or the .connected file is missing |
 | DEVICEMODE_SD_ERROR | Purple | The Schedule.json or Network.json is missing |
+| DEVICEMODE_SD_FULL | White | The SD card is 95% full, clean it or put in another card |
 | DEVICEMODE_SD | Blue | The system is running normally and it is recording to the local SD card. The recordings can be found in the folder called missed_transmissions |
 | DEVICEMODE_WIFI | Green | The system is running normally and it is sending the recording to the receiver IP over WiFi |
