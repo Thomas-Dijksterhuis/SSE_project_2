@@ -57,7 +57,7 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # NLMS
 M = 64
-MU = 0.25
+MU = 0.00245
 
 # ---------------------------------------------------------------------------
 # Per-device state
