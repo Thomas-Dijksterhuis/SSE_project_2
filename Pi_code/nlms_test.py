@@ -3,6 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from udp import DeviceState
+from scipy.optimize import minimize_scalar
+
+M = 64
 
 
 def read_wav_mono(path):
@@ -13,95 +16,50 @@ def read_wav_mono(path):
         x /= 32768.0
         return x
 
-
-def run(input, desired, speech, m=64, mu=0.1):
-    u = input
-    d = desired
-
-    n = min(len(u), len(d), len(speech))
-
+def evaluate(reference, target, desired, m, mu, warmup=None):
     device = DeviceState(m, mu)
+    cleaned = np.zeros(len(desired))
 
-    cleaned = np.zeros(n)
+    for i in range(len(desired)):
+        cleaned[i] = device.nlms_step(reference[i], desired[i])
 
-    for i in range(n):
-        cleaned[i] = device.nlms_step(u[i], d[i])
+    warmup = warmup or 10 * m
+    mse = np.mean((cleaned[warmup:] - target[warmup:]) ** 2)
+    return mse, cleaned
 
-    mse_before = np.mean((d[:n] - speech[:n])**2)
-    mse_after = np.mean((cleaned - speech[:n])**2)
 
-    print(f"MSE before: {mse_before:.6f}")
-    print(f"MSE after : {mse_after:.6f}")
+def run(reference, target, desired, m=64, mu=0.1):
+    n = min(len(reference), len(target), len(desired))
+    mse, cleaned = evaluate(reference, target, desired, m, mu)
 
     t = np.arange(n)
-
     fig, ax = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle(f"NLMS filter with MU={mu:.6f}. MSE={mse:.10e}")
 
-    ax[0].plot(t, speech)
-    ax[0].set_title("Original speech")
-
-    ax[1].plot(t, u)
-    ax[1].set_title("Reference noise")
-
-    ax[2].plot(t, d)
-    ax[2].set_title("Desired = speech + noise")
-
-    ax[3].plot(t, cleaned)
-    ax[3].set_title("NLMS output")
-
-    ax[3].sharey(ax[0])  # link output scale to original speech scale
+    ax[0].plot(t, target[:n]);   ax[0].set_title("Original (clean) input")
+    ax[1].plot(t, reference[:n]);  ax[1].set_title("Noise")
+    ax[2].plot(t, desired[:n]);  ax[2].set_title("Desired = input + noise")
+    ax[3].plot(t, cleaned[:n]);  ax[3].set_title("NLMS output")
+    ax[3].sharey(ax[0])
 
     plt.tight_layout()
     plt.show()
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(device.w)
-    plt.title("Learned filter coefficients")
-    plt.grid()
-    plt.show()
-
 
 if __name__ == "__main__":
-    speech = read_wav_mono("Test_recordings/test2/right.wav")
+    input_sig = read_wav_mono("Test_recordings/test2/left.wav")
+    noise_sig = read_wav_mono("Test_recordings/test2/right.wav")
 
-    reference = np.random.randn(len(speech))
-    reference /= np.max(np.abs(reference))
+    n = min(len(input_sig), len(noise_sig))
+    input_sig, noise_sig = input_sig[:n], noise_sig[:n]
+    desired = input_sig + noise_sig
 
-    noise = 0.1 * np.roll(reference, 50)
+    result = minimize_scalar(
+        lambda mu: evaluate(noise_sig, input_sig, desired, M, mu)[0],
+        bounds=(0.001, 0.35),
+        method="bounded",
+        options={"xatol": 1e-5}
+    )
+    print(f"Optimal mu = {result.x:.5f}, MSE = {result.fun:.10e}")
 
-    desired = speech + noise
-
-    n = len(speech)
-
-    Ms = [16, 32, 64, 128, 256]
-    MUs = [0.05, 0.1, 0.2, 0.25, 0.3]
-
-    best_error = np.inf
-    best = None
-
-    for m in Ms:
-        for mu in MUs:
-
-            device = DeviceState(m, mu)
-
-            cleaned = np.zeros(n)
-
-            for i in range(n):
-                cleaned[i] = device.nlms_step(reference[i], desired[i])
-
-            mse = np.mean((cleaned - speech) ** 2)
-
-            print(f"M={m:4d} MU={mu:4.2f} MSE={mse:.6f}")
-
-            if mse < best_error:
-                best_error = mse
-                best_error_signal = cleaned.copy()
-                best = (m, mu)
-
-    print()
-    print("Best parameters:")
-    print(f"M={best[0]} MU={best[1]} MSE={best_error:.6f}")
-
-    run(reference, desired, speech, m=best[0], mu=best[1])
-
-
+    run(noise_sig, input_sig, desired, m=M, mu=result.x)
